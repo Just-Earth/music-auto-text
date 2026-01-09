@@ -13,6 +13,9 @@ using LibVLCSharp.Shared;
 using System.Windows.Input;
 using System.IO;
 using System.Linq;
+using System.Threading;
+using System.Text.RegularExpressions;
+using System.Diagnostics;
 
 // Alias for VLC player
 using VlcPlayerType = LibVLCSharp.Shared.MediaPlayer;
@@ -34,6 +37,7 @@ namespace WpfApp1
 
         // keep media reference so we can delay play
         private Media? _pendingMedia = null;
+        private string? _pendingFilePath = null;
 
         // seek state
         private bool _isSeeking = false;
@@ -41,9 +45,26 @@ namespace WpfApp1
         // button-open state
         private bool _wasOpenedByButton = false;
 
+        // startup latency for playback
+        private double _playbackStartupLatencyMs = 0.0;
+        // automatic alignment offset (positive means move text earlier when applied as subtraction)
+        private double _autoSyncOffsetMs = 0.0;
+
+        // resync variable
+        private CancellationTokenSource? _resyncCts;
+        private bool _autoResyncEnabled = true; // enabled by default
+
+        private WhisperClient? _whisperClient = null;
+
+        // Neural aligner optional
+        private NeuralAligner? _neuralAligner = null;
+        private bool _useNeuralAligner = false; // disabled by default
+
         public MainWindow()
         {
             InitializeComponent();
+
+            _whisperClient = new WhisperClient();
 
             // ensure ProgressCanvas events wired in case XAML not loaded handlers
             ProgressCanvas.MouseLeftButtonDown += ProgressCanvas_MouseLeftButtonDown;
@@ -73,6 +94,23 @@ namespace WpfApp1
             PlayPauseBottomButton.Click += PlayPauseButton_Click;
             BackButton.Click += BackButton_Click;
 
+            // install deps button hookup
+            InstallDepsButton.Click += InstallDepsButton_Click;
+
+            // Lyrics overlay buttons
+            LoadLyricsButton.Click += LoadLyricsButton_Click;
+            CancelLyricsButton.Click += CancelLyricsButton_Click;
+            RetryLyricsButton.Click += RetryLyricsButton_Click;
+            ContinueNoLyricsButton.Click += ContinueNoLyricsButton_Click;
+            ExitToMenuButton.Click += ExitToMenuButton_Click;
+
+            // neural aligner buttons
+            GenerateSamplesButton.Click += GenerateSamplesButton_Click;
+            TrainModelButton.Click += TrainModelButton_Click;
+            UseNeuralAlignButton.Click += UseNeuralAlignButton_Click;
+            // reflect initial state
+            UseNeuralAlignButton.Content = "Использовать нейрон: выкл";
+
             _progressTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
             _progressTimer.Tick += ProgressTimer_Tick;
 
@@ -89,6 +127,51 @@ namespace WpfApp1
             catch { }
         }
 
+        private void UseNeuralAlignButton_Click(object? sender, RoutedEventArgs e)
+        {
+            _useNeuralAligner = !_useNeuralAligner;
+            if (_useNeuralAligner)
+            {
+                // lazy create
+                try
+                {
+                    _neuralAligner ??= new NeuralAligner();
+                    var model = _neuralAligner.LoadModel();
+                    if (model == null)
+                    {
+                        MessageBox.Show("Модель нейронной сети не найдена. Обучите модель или отключите использование нейрона.", "Инфо", MessageBoxButton.OK, MessageBoxImage.Information);
+                    }
+                }
+                catch
+                {
+                    MessageBox.Show("Не удалось инициализировать нейронный модуль.", "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
+                    _useNeuralAligner = false;
+                }
+            }
+            UseNeuralAlignButton.Content = _useNeuralAligner ? "Использовать нейрон: вкл" : "Использовать нейрон: выкл";
+        }
+
+        private void GenerateSamplesButton_Click(object? sender, RoutedEventArgs e)
+        {
+            // feature potentially unsafe; keep as no-op but inform user
+            MessageBox.Show("Генерация обучающих примеров отключена в этой версии.", "Инфо", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+
+        private void TrainModelButton_Click(object? sender, RoutedEventArgs e)
+        {
+            try
+            {
+                _neuralAligner ??= new NeuralAligner();
+                bool ok = _neuralAligner.TrainFromDb();
+                if (ok) MessageBox.Show("Обучение завершено и модель сохранена.", "Готово", MessageBoxButton.OK, MessageBoxImage.Information);
+                else MessageBox.Show("Нет данных для обучения или ошибка при обучении.", "Инфо", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Ошибка обучения: " + ex.Message, "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
         private void VlcPlayer_EndReached(object? sender, EventArgs e)
         {
             Dispatcher.Invoke(() =>
@@ -96,6 +179,9 @@ namespace WpfApp1
                 _isPlaying = false;
                 PlayPauseBottomButton.Content = "▶";
                 _progressTimer.Stop();
+
+                // stop resync
+                _resyncCts?.Cancel();
             });
         }
 
@@ -137,6 +223,9 @@ namespace WpfApp1
                 _isPlaying = false;
                 PlayPauseBottomButton.Content = "▶";
                 _progressTimer.Stop();
+
+                // pause resync
+                _resyncCts?.Cancel();
             }
             else
             {
@@ -144,6 +233,14 @@ namespace WpfApp1
                 _isPlaying = true;
                 PlayPauseBottomButton.Content = "⏸";
                 _progressTimer.Start();
+
+                // resume resync
+                if (_autoResyncEnabled)
+                {
+                    _resyncCts?.Cancel();
+                    _resyncCts = new CancellationTokenSource();
+                    _ = StartAutoResyncLoopAsync(_resyncCts.Token);
+                }
             }
         }
 
@@ -155,6 +252,7 @@ namespace WpfApp1
             if (result == true)
             {
                 var path = dlg.FileName;
+                _pendingFilePath = path;
 
                 // Update UI immediately: hide left column and show player chrome
                 Dispatcher.Invoke(() =>
@@ -176,6 +274,15 @@ namespace WpfApp1
 
                     // Start logo move storyboard dynamically
                     StartLogoAnimation();
+
+                    // Show lyrics input overlay
+                    LyricsInputOverlay.Visibility = Visibility.Visible;
+                    LyricsNotFoundPanel.Visibility = Visibility.Collapsed;
+
+                    // prefill artist/title from filename if possible
+                    var (artist, title) = ParseFilenameForArtistTitle(path);
+                    ArtistTextBox.Text = artist;
+                    TitleTextBox.Text = title;
                 });
 
                 try
@@ -186,95 +293,393 @@ namespace WpfApp1
 
                     _pendingMedia = new Media(_libVLC!, new Uri(path));
 
-                    // do NOT start playing immediately; we'll start after animations finish
+                    // do NOT start playing immediately; wait until user loads lyrics or chooses to continue
                 }
                 catch
                 {
                     MessageBox.Show("Failed to open media.");
                 }
 
-                // fetch lyrics
-                var rawLines = await _lyricsService.FetchLyricsByFilenameAsync(path);
+            }
+        }
 
-                // detect fallback: if service returned words from the filename (common fallback), do not render duplicate title
-                var filename = System.IO.Path.GetFileNameWithoutExtension(path);
-                var filenameWords = filename.Split(new[] { ' ', '-', '_' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(w => w.ToLowerInvariant()).ToList();
+        private (string artist, string title) ParseFilenameForArtistTitle(string path)
+        {
+            var filename = System.IO.Path.GetFileNameWithoutExtension(path).Replace('_', ' ').Trim();
+            var parts = filename.Split('-', 2, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 2)
+            {
+                return (parts[0].Trim(), parts[1].Trim());
+            }
+            return (string.Empty, filename);
+        }
 
-                bool isFallback = rawLines != null && rawLines.Count > 0 && rawLines.All(l =>
-                    l.Text.Split(' ', StringSplitOptions.RemoveEmptyEntries).All(w => filenameWords.Contains(w.ToLowerInvariant())));
+        private async void LoadLyricsButton_Click(object? sender, RoutedEventArgs e)
+        {
+            var artist = ArtistTextBox.Text?.Trim() ?? string.Empty;
+            var title = TitleTextBox.Text?.Trim() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(artist) || string.IsNullOrWhiteSpace(title))
+            {
+                MessageBox.Show("Введите артиста и название трека.");
+                return;
+            }
+
+            // attempt to fetch from lyrics.ovh
+            LyricsInputOverlay.IsEnabled = false;
+            var raw = await _lyricsService.FetchLyricsRawByArtistTitleAsync(artist, title);
+            LyricsInputOverlay.IsEnabled = true;
+
+            if (!string.IsNullOrWhiteSpace(raw))
+            {
+                // use original lyric lines instead of fixed 5-word chunks
+                var lines = raw.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+                               .Select(l => l.Trim())
+                               .Where(l => !string.IsNullOrWhiteSpace(l))
+                               .ToList();
 
                 _currentLyrics.Clear();
-                if (!isFallback)
+
+                List<LyricsLine> aligned = null;
+                // try whisper forced-align flow
+                try
                 {
-                    // flatten rawLines into words and group into chunks of ~6 words
-                    var words = new List<string>();
-                    foreach (var l in rawLines)
+                    var segments = await _whisperClient.TranscribeAsync(_pendingFilePath ?? string.Empty, "small");
+                    if (segments != null && segments.Count > 0)
                     {
-                        var parts = l.Text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                        words.AddRange(parts);
+                        // build a word-level list from segments
+                        var wordTimes = new List<(string word, double start, double end)>();
+                        foreach (var seg in segments)
+                        {
+                            var words = Regex.Split(seg.Text.Trim(), "\\s+") .Where(w => !string.IsNullOrWhiteSpace(w)).ToArray();
+                            if (words.Length == 0) continue;
+                            double segStart = seg.Start; double segEnd = seg.End;
+                            double dur = segEnd - segStart;
+                            for (int wi = 0; wi < words.Length; wi++)
+                            {
+                                double wstart = segStart + (dur * wi) / words.Length;
+                                double wend = segStart + (dur * (wi + 1)) / words.Length;
+                                wordTimes.Add((words[wi], wstart, wend));
+                            }
+                        }
+
+                        // map lines (which may be phrases) to earliest word time that contains matching words
+                        for (int i = 0; i < lines.Count; i++)
+                        {
+                            var ln = lines[i];
+                            var lnWords = Regex.Split(ln, "\\s+").Where(w => !string.IsNullOrWhiteSpace(w)).Select(w => w.Trim(new char[]{',','.', '"','\'','!','?'}).ToLower()).ToList();
+                            double chosen = 0.0; bool found = false; bool scream = false;
+                            for (int wi = 0; wi < wordTimes.Count; wi++)
+                            {
+                                var wt = wordTimes[wi];
+                                var wclean = wt.word.Trim(new char[]{',','.', '"','\'','!','?'}).ToLower();
+                                if (lnWords.Contains(wclean))
+                                {
+                                    chosen = wt.start; found = true;
+                                    // detect scream by checking if word period overlaps a high-energy window (use earlier RMS features)
+                                    // simple heuristic: if word chunk duration < 0.5s and uppercase letters exist assume shout
+                                    if (wt.word.Any(c => char.IsUpper(c)) || wt.end - wt.start < 0.35) scream = true;
+                                    break;
+                                }
+                            }
+                            if (!found)
+                            {
+                                // fallback to previous alignment methods
+                            }
+                            _currentLyrics.Add(new LyricsLine { Timestamp = TimeSpan.FromSeconds(chosen), Text = ln, IsScream = scream });
+                        }
                     }
-                    var chunks = new List<string>();
-                    for (int i = 0; i < words.Count; i += 6)
+                }
+                catch { aligned = null; }
+
+                // If whisper didn't produce useful alignment, optionally try neural aligner if enabled
+                if ((_currentLyrics == null || _currentLyrics.Count == 0) && _useNeuralAligner && !string.IsNullOrWhiteSpace(_pendingFilePath) && File.Exists(_pendingFilePath))
+                {
+                    try
                     {
-                        var take = Math.Min(6, words.Count - i);
-                        chunks.Add(string.Join(' ', words.GetRange(i, take)));
+                        _neuralAligner ??= new NeuralAligner();
+                        var model = _neuralAligner.LoadModel();
+                        if (model != null)
+                        {
+                            var neural = await Task.Run(() => _neuralAligner.AlignTextToAudioWithModel(_pendingFilePath!, lines));
+                            if (neural != null && neural.Count > 0)
+                            {
+                                _currentLyrics = neural;
+                            }
+                        }
+                        else
+                        {
+                            // model not present - inform user
+                            MessageBox.Show("Модель нейронной сети не найдена. Выключите использование нейрона или обучите модель.", "Инфо", MessageBoxButton.OK, MessageBoxImage.Information);
+                        }
                     }
-                    var t = TimeSpan.Zero;
-                    foreach (var c in chunks)
+                    catch { }
+                }
+
+                if (aligned != null && aligned.Count == lines.Count)
+                {
+                    _currentLyrics = aligned;
+                }
+
+                // if no alignment was produced, fall back to using the raw lines or estimated timestamps
+                if (_currentLyrics == null || _currentLyrics.Count == 0)
+                {
+                    // try to estimate timestamps for each line from audio
+                    List<TimeSpan>? estimates = null;
+                    if (!string.IsNullOrWhiteSpace(_pendingFilePath) && File.Exists(_pendingFilePath))
                     {
-                        _currentLyrics.Add(new LyricsLine { Timestamp = t, Text = c });
-                        t = t.Add(TimeSpan.FromSeconds(3));
+                        try
+                        {
+                            estimates = await _lyricsService.EstimateTimestampsFromAudioAsync(_pendingFilePath, lines.Count);
+                        }
+                        catch { estimates = null; }
+                    }
+
+                    if (estimates != null && estimates.Count == lines.Count)
+                    {
+                        for (int i = 0; i < lines.Count; i++)
+                        {
+                            _currentLyrics.Add(new LyricsLine { Timestamp = estimates[i], Text = lines[i] });
+                        }
+                    }
+                    else
+                    {
+                        // fallback: place lines uniformly across the track (or short fixed spacing)
+                        double chunkSeconds = 2.0;
+                        if (_vlcPlayer != null && _vlcPlayer.Length > 0 && lines.Count > 0)
+                        {
+                            var totalSec = _vlcPlayer.Length / 1000.0;
+                            chunkSeconds = Math.Max(0.25, totalSec / lines.Count);
+                        }
+
+                        var t = TimeSpan.Zero;
+                        foreach (var ln in lines)
+                        {
+                            _currentLyrics.Add(new LyricsLine { Timestamp = t, Text = ln });
+                            t = t.Add(TimeSpan.FromSeconds(chunkSeconds));
+                        }
                     }
                 }
 
-                // filter out any lyric chunks that are identical to the title to avoid overlap
-                var titleLower = filename.ToLowerInvariant();
-                _currentLyrics = _currentLyrics.Where(ll => !string.Equals(ll.Text.Trim(), titleLower, StringComparison.OrdinalIgnoreCase) && !ll.Text.ToLowerInvariant().Contains(titleLower)).ToList();
+                // ensure sorted
+                _currentLyrics = _currentLyrics.OrderBy(x => x.Timestamp).ToList();
 
-                // render only if we have real lyrics
+                // render and hide overlay
                 RenderLyrics(_currentLyrics);
+                LyricsInputOverlay.Visibility = Visibility.Collapsed;
 
-                // start timer later when media begins
-                _isPlaying = false;
+                // start playback flow (delayed so animations complete)
+                await StartPlaybackAfterLyricsLoadedAsync();
+            }
+            else
+            {
+                // show not found options
+                LyricsNotFoundPanel.Visibility = Visibility.Visible;
+            }
+        }
 
-                // Wait for a short time to allow animations to run, then fade in player and start playback
-                await Task.Delay(800);
+        private async Task StartPlaybackAfterLyricsLoadedAsync()
+        {
+            // small wait for UI
+            await Task.Delay(500);
 
-                Dispatcher.Invoke(() =>
+            Dispatcher.Invoke(() =>
+            {
+                // fade-in title and player more slowly
+                var titleFade = new DoubleAnimation(0, 1, new Duration(TimeSpan.FromMilliseconds(900))) { EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut } };
+                SongTitleText.BeginAnimation(UIElement.OpacityProperty, titleFade);
+
+                var progressFade = new DoubleAnimation(0, 1, new Duration(TimeSpan.FromMilliseconds(900))) { EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut }, BeginTime = TimeSpan.FromMilliseconds(200) };
+                ProgressAreaGrid.BeginAnimation(UIElement.OpacityProperty, progressFade);
+
+                var playFade = new DoubleAnimation(0, 1, new Duration(TimeSpan.FromMilliseconds(900))) { BeginTime = TimeSpan.FromMilliseconds(200) };
+                PlayPauseBottomButton.BeginAnimation(UIElement.OpacityProperty, playFade);
+            });
+
+            await Task.Delay(700);
+
+            // start media
+            try
+            {
+                if (_pendingMedia != null && _vlcPlayer != null)
                 {
-                    // ensure progress area visible and animate opacity if not already
-                    ProgressAreaGrid.Visibility = Visibility.Visible;
-                    PlayPauseBottomButton.Visibility = Visibility.Visible;
-                    // make fades slower
-                    var titleFade = new DoubleAnimation(0, 1, new Duration(TimeSpan.FromMilliseconds(700))) { EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut } };
-                    SongTitleText.BeginAnimation(UIElement.OpacityProperty, titleFade);
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    _vlcPlayer.Play(_pendingMedia);
+                    _isPlaying = true;
+                    PlayPauseBottomButton.Content = "⏸";
 
-                    var progressFade = new DoubleAnimation(0, 1, new Duration(TimeSpan.FromMilliseconds(700))) { EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut }, BeginTime = TimeSpan.FromMilliseconds(200) };
-                    ProgressAreaGrid.BeginAnimation(UIElement.OpacityProperty, progressFade);
+                    // measure startup latency: time from Play() call to when VLC reports >0ms playback time
+                    long observedPlayerTime = 0;
+                    int waited = 0;
+                    while (waited < 1500)
+                    {
+                        await Task.Delay(30);
+                        waited += 30;
+                        try { observedPlayerTime = _vlcPlayer.Time; } catch { observedPlayerTime = 0; }
+                        if (observedPlayerTime > 0) break;
+                    }
 
-                    var playFade = new DoubleAnimation(0, 1, new Duration(TimeSpan.FromMilliseconds(700))) { BeginTime = TimeSpan.FromMilliseconds(200) };
-                    PlayPauseBottomButton.BeginAnimation(UIElement.OpacityProperty, playFade);
-                });
+                    sw.Stop();
+                    // compute latency as wall time elapsed minus player's internal time
+                    // if observedPlayerTime is 0 (timeout), set latency to 0
+                    if (observedPlayerTime > 0)
+                    {
+                        var latencyMs = Math.Max(0.0, sw.Elapsed.TotalMilliseconds - observedPlayerTime);
+                        _playbackStartupLatencyMs = latencyMs;
+                    }
+                    else
+                    {
+                        _playbackStartupLatencyMs = 0.0;
+                    }
 
-                // short delay before play so user sees fade-ins
-                await Task.Delay(450);
+                    _progressTimer.Start();
 
-                // finally start playback
+                    // start auto-resync loop
+                    if (_autoResyncEnabled)
+                    {
+                        _resyncCts?.Cancel();
+                        _resyncCts = new CancellationTokenSource();
+                        _ = StartAutoResyncLoopAsync(_resyncCts.Token);
+                    }
+                }
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+
+        private void RetryLyricsButton_Click(object? sender, RoutedEventArgs e)
+        {
+            // allow user to edit inputs again
+            LyricsNotFoundPanel.Visibility = Visibility.Collapsed;
+        }
+
+        private async void ContinueNoLyricsButton_Click(object? sender, RoutedEventArgs e)
+        {
+            // hide overlay and proceed without lyrics (use fallback from filename)
+            LyricsInputOverlay.Visibility = Visibility.Collapsed;
+
+            // generate fallback from pending file title and distribute over media length if possible
+            var filename = System.IO.Path.GetFileNameWithoutExtension(_pendingFilePath ?? string.Empty);
+            var words = filename.Split(new[] { ' ', '-', '_' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                                .Where(w => !string.IsNullOrWhiteSpace(w)).ToList();
+
+            _currentLyrics.Clear();
+
+            // Attempt to estimate timestamps from audio file
+            List<TimeSpan>? estimates = null;
+            if (!string.IsNullOrWhiteSpace(_pendingFilePath) && File.Exists(_pendingFilePath))
+            {
                 try
                 {
-                    if (_pendingMedia != null && _vlcPlayer != null)
-                    {
-                        _vlcPlayer.Play(_pendingMedia);
-                        _isPlaying = true;
-                        PlayPauseBottomButton.Content = "⏸";
-                        _progressTimer.Start();
-                    }
+                    estimates = await _lyricsService.EstimateTimestampsFromAudioAsync(_pendingFilePath, words.Count);
                 }
                 catch
                 {
-                    // ignore
+                    estimates = null;
                 }
             }
+
+            double chunkSeconds = 2.0;
+            if (_vlcPlayer != null && _vlcPlayer.Length > 0 && words.Count > 0)
+            {
+                var totalSec = _vlcPlayer.Length / 1000.0;
+                chunkSeconds = Math.Max(0.25, totalSec / words.Count);
+            }
+
+            if (estimates != null && estimates.Count == words.Count)
+            {
+                for (int i = 0; i < words.Count; i++)
+                {
+                    _currentLyrics.Add(new LyricsLine { Timestamp = estimates[i], Text = words[i] });
+                }
+            }
+            else
+            {
+                var t = TimeSpan.Zero;
+                foreach (var c in words)
+                {
+                    _currentLyrics.Add(new LyricsLine { Timestamp = t, Text = c });
+                    t = t.Add(TimeSpan.FromSeconds(chunkSeconds));
+                }
+            }
+
+            _currentLyrics = _currentLyrics.OrderBy(x => x.Timestamp).ToList();
+
+            // compute automatic alignment offset for fallback words
+            try
+            {
+                var wordLines = words; // list of words used
+                var offsetMs2 = await _lyricsService.ComputeAlignmentOffsetMs(_pendingFilePath ?? string.Empty, wordLines);
+                _autoSyncOffsetMs = -offsetMs2;
+            }
+            catch
+            {
+                _autoSyncOffsetMs = 0.0;
+            }
+            RenderLyrics(_currentLyrics);
+
+            // start playback flow
+            _ = StartPlaybackAfterLyricsLoadedAsync();
+        }
+
+        private void ExitToMenuButton_Click(object? sender, RoutedEventArgs e)
+        {
+            // stop and return to main menu
+            LyricsInputOverlay.Visibility = Visibility.Collapsed;
+            _vlcPlayer?.Stop();
+            _resyncCts?.Cancel();
+            _pendingMedia?.Dispose();
+            _pendingMedia = null;
+            _isPlaying = false;
+
+            // restore UI
+            ProgressAreaGrid.Visibility = Visibility.Collapsed;
+            PlayPauseBottomButton.Visibility = Visibility.Collapsed;
+            BackButton.Visibility = Visibility.Collapsed;
+            SongTitleText.Text = string.Empty;
+
+            if (RootGrid.ColumnDefinitions.Count > 0)
+            {
+                RootGrid.ColumnDefinitions[0].Width = new GridLength(280);
+            }
+            LeftButtonsPanel.Visibility = Visibility.Visible;
+            LyricsPanel.Children.Clear();
+
+            _progressTimer.Stop();
+
+            // animate logo back
+            var duration = new Duration(TimeSpan.FromMilliseconds(520));
+            var easing = new QuadraticEase { EasingMode = EasingMode.EaseOut };
+
+            var scaleXAnim = new DoubleAnimation(LargeLogoScale.ScaleX, 1.0, duration) { EasingFunction = easing };
+            var scaleYAnim = new DoubleAnimation(LargeLogoScale.ScaleY, 1.0, duration) { EasingFunction = easing };
+            var transXAnim = new DoubleAnimation(LargeLogoTranslate.X, 0.0, duration) { EasingFunction = easing };
+            var transYAnim = new DoubleAnimation(LargeLogoTranslate.Y, 0.0, duration) { EasingFunction = easing };
+
+            transYAnim.Completed += (s, ev) =>
+            {
+                LargeLogoTranslate.X = 0.0;
+                LargeLogoTranslate.Y = 0.0;
+                LargeLogoScale.ScaleX = 1.0;
+                LargeLogoScale.ScaleY = 1.0;
+
+                // ensure opacity/reset of player elements
+                ProgressAreaGrid.Opacity = 0;
+                PlayPauseBottomButton.Opacity = 0;
+                SongTitleText.Opacity = 0;
+            };
+
+            LargeLogoScale.BeginAnimation(ScaleTransform.ScaleXProperty, scaleXAnim);
+            LargeLogoScale.BeginAnimation(ScaleTransform.ScaleYProperty, scaleYAnim);
+            LargeLogoTranslate.BeginAnimation(TranslateTransform.XProperty, transXAnim);
+            LargeLogoTranslate.BeginAnimation(TranslateTransform.YProperty, transYAnim);
+        }
+
+        private void CancelLyricsButton_Click(object? sender, RoutedEventArgs e)
+        {
+            // treat cancel as continue without lyrics
+            ContinueNoLyricsButton_Click(sender, e);
         }
 
         private void StartLogoAnimation()
@@ -358,6 +763,7 @@ namespace WpfApp1
         {
             // stop playback and return to main menu
             _vlcPlayer?.Stop();
+            _resyncCts?.Cancel();
             _pendingMedia?.Dispose();
             _pendingMedia = null;
             _isPlaying = false;
@@ -421,20 +827,47 @@ namespace WpfApp1
         private void RenderLyrics(List<LyricsLine> lyrics)
         {
             LyricsPanel.Children.Clear();
+            if (lyrics == null || lyrics.Count == 0)
+            {
+                var noTb = new TextBlock { Text = "Текст не найден", Foreground = Brushes.Gray, FontSize = 16, Margin = new Thickness(6), Opacity = 0.9 };
+                LyricsPanel.Children.Add(noTb);
+                return;
+            }
+
             foreach (var line in lyrics)
             {
-                var tb = new TextBlock { Text = line.Text, Foreground = Brushes.White, FontSize = 24, Margin = new Thickness(4), Opacity = 0.6, Tag = line };
+                var tb = new TextBlock { Text = line.Text, Foreground = line.IsScream ? Brushes.Red : Brushes.White, FontSize = 24, Margin = new Thickness(4), Opacity = 1.0, Tag = line, TextWrapping = TextWrapping.Wrap };
+                if (line.IsScream) { tb.FontWeight = FontWeights.Bold; }
                 LyricsPanel.Children.Add(tb);
             }
+
+            // scroll to top so user sees the first lines
+            try
+            {
+                var sv = LyricsPanel.Parent as ScrollViewer;
+                if (sv != null) sv.ScrollToTop();
+            }
+            catch { }
         }
 
         private void ApplyIntensityToLyricsStatic(TimeSpan time)
         {
+            // adjust time by measured startup latency so display lines align with real audio
+            var adjusted = time;
+            if (_playbackStartupLatencyMs > 1.0)
+            {
+                adjusted = time - TimeSpan.FromMilliseconds(_playbackStartupLatencyMs);
+                if (adjusted < TimeSpan.Zero) adjusted = TimeSpan.Zero;
+            }
+
+            // apply automatic offset
+            adjusted = adjusted.Add(TimeSpan.FromMilliseconds(-_autoSyncOffsetMs));
+
             // highlight nearest lyrics line without dynamic intensity styling
             LyricsLine? nearest = null;
             foreach (var l in _currentLyrics)
             {
-                if (l.Timestamp <= time) nearest = l;
+                if (l.Timestamp <= adjusted) nearest = l;
                 else break;
             }
             if (nearest == null) return;
@@ -520,6 +953,7 @@ namespace WpfApp1
 
         protected override void OnClosed(EventArgs e)
         {
+            _resyncCts?.Cancel();
             _vlcPlayer?.Dispose();
             _libVLC?.Dispose();
             _pendingMedia?.Dispose();
@@ -698,6 +1132,127 @@ namespace WpfApp1
             {
                 // ignore
             }
+        }
+
+        private async void InstallDepsButton_Click(object? sender, RoutedEventArgs e)
+        {
+            var msg = "Устанавливаются зависимости. Это может занять время. Продолжать?";
+            if (MessageBox.Show(msg, "Подтвердите", MessageBoxButton.YesNo) != MessageBoxResult.Yes) return;
+
+            InstallDepsButton.IsEnabled = false;
+            InstallDepsButton.Content = "Установка...";
+
+            // show progress UI
+            DepsProgressPanel.Visibility = Visibility.Visible;
+            DepsProgressBar.Value = 0;
+            DepsStatusText.Text = "Подготовка...";
+
+            try
+            {
+                // step 1: check python
+                DepsStatusText.Text = "Проверка python...";
+                await Task.Delay(200);
+                var pythonCheck = await RunCommandAsync("python", "-m pip --version");
+                DepsProgressBar.Value = 10;
+
+                // step 2: upgrade pip
+                DepsStatusText.Text = "Обновление pip...";
+                await Task.Delay(200);
+                await RunCommandAsync("python", "-m pip install --upgrade pip");
+                DepsProgressBar.Value = 35;
+
+                // step 3: install openai-whisper
+                DepsStatusText.Text = "Установка openai-whisper...";
+                await Task.Delay(200);
+                await RunCommandAsync("python", "-m pip install -U openai-whisper");
+                DepsProgressBar.Value = 60;
+
+                // step 4: install whisperX
+                DepsStatusText.Text = "Установка whisperX (через git)...";
+                await Task.Delay(200);
+                await RunCommandAsync("python", "-m pip install -U git+https://github.com/m-bain/whisperX.git");
+                DepsProgressBar.Value = 80;
+
+                // step 5: install CPU torch
+                DepsStatusText.Text = "Установка torch (CPU)...";
+                await Task.Delay(200);
+                await RunCommandAsync("python", "-m pip install --index-url https://download.pytorch.org/whl/cpu torch");
+                DepsProgressBar.Value = 100;
+
+                DepsStatusText.Text = "Установлено. Возможен перезапуск приложения.";
+                MessageBox.Show("Зависимости установлены. Возможно потребуется перезапуск приложения.");
+            }
+            catch (Exception ex)
+            {
+                DepsStatusText.Text = "Ошибка: " + ex.Message.Replace("\n", " ");
+                MessageBox.Show("Ошибка установки: " + ex.Message);
+            }
+            finally
+            {
+                InstallDepsButton.IsEnabled = true;
+                InstallDepsButton.Content = "Установить зависимости (Python)";
+                // hide progress after short delay
+                await Task.Delay(1200);
+                DepsProgressPanel.Visibility = Visibility.Collapsed;
+            }
+        }
+
+        private async Task<string> RunCommandAsync(string fileName, string args)
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = fileName,
+                Arguments = args,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var p = Process.Start(psi);
+            if (p == null) throw new Exception("Не удалось запустить " + fileName);
+            var outStr = await p.StandardOutput.ReadToEndAsync();
+            var errStr = await p.StandardError.ReadToEndAsync();
+            await p.WaitForExitAsync();
+            if (p.ExitCode != 0) throw new Exception(errStr + "\n" + outStr);
+            return outStr;
+        }
+
+        private async Task StartAutoResyncLoopAsync(CancellationToken token)
+        {
+            try
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    // only run while playing and file exists
+                    if (!_isPlaying || string.IsNullOrWhiteSpace(_pendingFilePath) || !File.Exists(_pendingFilePath) || _currentLyrics == null || _currentLyrics.Count == 0)
+                    {
+                        await Task.Delay(1000, token);
+                        continue;
+                    }
+
+                    // compute alignment offset in background
+                    List<string> lines = _currentLyrics.Select(l => l.Text).ToList();
+                    double offsetMs = 0.0;
+                    try
+                    {
+                        offsetMs = await _lyricsService.ComputeAlignmentOffsetMs(_pendingFilePath!, lines);
+                    }
+                    catch { offsetMs = 0.0; }
+
+                    // invert as before
+                    double newAuto = -offsetMs;
+                    // smooth update to avoid jumps
+                    lock (this)
+                    {
+                        _autoSyncOffsetMs = _autoSyncOffsetMs * 0.85 + newAuto * 0.15;
+                    }
+
+                    // wait before next resync
+                    await Task.Delay(5000, token);
+                }
+            }
+            catch (TaskCanceledException) { }
+            catch { }
         }
     }
 }

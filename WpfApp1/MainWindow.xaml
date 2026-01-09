@@ -191,6 +191,18 @@
         <StackPanel x:Name="LeftButtonsPanel" Grid.Column="0" VerticalAlignment="Center" HorizontalAlignment="Left" Margin="10" Panel.ZIndex="2">
             <Button x:Name="LoadMp3Button" Content="загрузить свое mp3" Margin="0,0,0,10" Width="212" Height="55" FontSize="18" />
             <Button x:Name="RealTimeButton" Content="Real Time" Width="212" Height="55" FontSize="18" />
+
+            <!-- Neural aligner tools -->
+            <Button x:Name="GenerateSamplesButton" Content="Сгенерировать примеры" Margin="0,12,0,6" Width="212" Height="40" FontSize="14" />
+            <Button x:Name="TrainModelButton" Content="Обучить модель" Margin="0,0,0,6" Width="212" Height="40" FontSize="14" />
+            <Button x:Name="UseNeuralAlignButton" Content="Использовать нейрон" Margin="0,0,0,6" Width="212" Height="40" FontSize="14" />
+            <Button x:Name="InstallDepsButton" Content="Установить зависимости (Python)" Margin="0,6,0,6" Width="212" Height="40" FontSize="14" />
+
+            <!-- Dependency install progress UI -->
+            <StackPanel x:Name="DepsProgressPanel" Width="212" Margin="0,8,0,0" Visibility="Collapsed">
+                <TextBlock x:Name="DepsStatusText" Text="" Foreground="White" FontSize="12" TextWrapping="Wrap" />
+                <ProgressBar x:Name="DepsProgressBar" Height="14" Minimum="0" Maximum="100" Value="0" Margin="0,6,0,0" />
+            </StackPanel>
         </StackPanel>
 
         <!-- Settings button top-right -->
@@ -200,7 +212,7 @@
         <TextBlock x:Name="SongTitleText" Grid.ColumnSpan="2" Text="" Foreground="White" FontSize="24" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,12,0,0" TextAlignment="Center" Opacity="0" />
 
         <!-- Large centered logo -->
-        <TextBlock x:Name="LargeLogoText" Grid.ColumnSpan="2" Text="Just Earth" Foreground="White" FontSize="92" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center" TextAlignment="Center" Panel.ZIndex="4" RenderTransformOrigin="0.5,0.5">
+        <TextBlock x:Name="LargeLogoText" Grid.ColumnSpan="2" Text="This is Earth" Foreground="White" FontSize="92" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center" TextAlignment="Center" Panel.ZIndex="4" RenderTransformOrigin="0.5,0.5">
             <TextBlock.RenderTransform>
                 <TransformGroup>
                     <ScaleTransform x:Name="LargeLogoScale" ScaleX="1" ScaleY="1" />
@@ -357,6 +369,37 @@
                             <Button x:Name="CloseSettingsButton" Content="Закрыть" Width="80" Margin="8,0,0,0" />
                         </StackPanel>
                     </Grid>
+                </Border>
+            </Grid>
+        </Border>
+
+        <!-- Lyrics input overlay shown after selecting file -->
+        <Border x:Name="LyricsInputOverlay" Grid.ColumnSpan="2" Background="#CC000000" Visibility="Collapsed" Panel.ZIndex="200">
+            <Grid HorizontalAlignment="Center" VerticalAlignment="Center" Width="640" Height="260">
+                <Border Background="#111111" CornerRadius="8" Padding="18">
+                    <StackPanel>
+                        <TextBlock Text="Введите артиста и название трека" Foreground="White" FontSize="18" FontWeight="Bold" Margin="0,0,0,12" />
+                        <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                            <TextBlock Text="Артист:" Foreground="White" VerticalAlignment="Center" Width="80" />
+                            <TextBox x:Name="ArtistTextBox" Width="420" Height="28" />
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                            <TextBlock Text="Трек:" Foreground="White" VerticalAlignment="Center" Width="80" />
+                            <TextBox x:Name="TitleTextBox" Width="420" Height="28" />
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+                            <Button x:Name="LoadLyricsButton" Content="Загрузить текст" Width="140" Margin="0,0,8,0" />
+                            <Button x:Name="CancelLyricsButton" Content="Отмена" Width="80" />
+                        </StackPanel>
+
+                        <!-- area for not-found actions -->
+                        <StackPanel x:Name="LyricsNotFoundPanel" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,12,0,0" Visibility="Collapsed">
+                            <Button x:Name="RetryLyricsButton" Content="Попробовать снова" Width="140" Margin="6,0" />
+                            <Button x:Name="ContinueNoLyricsButton" Content="Продолжить без текста" Width="160" Margin="6,0" />
+                            <Button x:Name="ExitToMenuButton" Content="Выйти в меню" Width="120" Margin="6,0" />
+                        </StackPanel>
+                    </StackPanel>
                 </Border>
             </Grid>
         </Border>
