@@ -11,13 +11,17 @@ except Exception as e:
 parser = argparse.ArgumentParser()
 parser.add_argument('--input', '-i', required=True)
 parser.add_argument('--model', '-m', default='small')
+parser.add_argument('--device', '-d', default='cpu')
 args = parser.parse_args()
 
 audio_path = args.input
 model_name = args.model
+device = args.device
 
 try:
-    model = whisper.load_model(model_name)
+    # whisper.load_model supports device="cuda" or device="cpu" via kwargs
+    model = whisper.load_model(model_name, device=device) if 'device' in whisper.load_model.__code__.co_varnames else whisper.load_model(model_name)
+    # ensure model on correct device for older APIs
     result = model.transcribe(audio_path)
     segments = result.get('segments', [])
     out = {'segments': []}

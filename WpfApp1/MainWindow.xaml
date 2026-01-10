@@ -192,10 +192,27 @@
             <Button x:Name="LoadMp3Button" Content="загрузить свое mp3" Margin="0,0,0,10" Width="212" Height="55" FontSize="18" />
             <Button x:Name="RealTimeButton" Content="Real Time" Width="212" Height="55" FontSize="18" />
 
-            <!-- Neural aligner tools -->
-            <Button x:Name="GenerateSamplesButton" Content="Сгенерировать примеры" Margin="0,12,0,6" Width="212" Height="40" FontSize="14" />
-            <Button x:Name="TrainModelButton" Content="Обучить модель" Margin="0,0,0,6" Width="212" Height="40" FontSize="14" />
-            <Button x:Name="UseNeuralAlignButton" Content="Использовать нейрон" Margin="0,0,0,6" Width="212" Height="40" FontSize="14" />
+            <!-- Model selection for Whisper -->
+            <StackPanel Orientation="Vertical" Margin="0,12,0,6" Width="212">
+                <TextBlock Text="Модель Whisper:" Foreground="White" FontSize="12" Margin="2,0,0,4" />
+                <ComboBox x:Name="ModelComboBox" Width="212" Height="28">
+                    <ComboBoxItem Content="tiny" IsSelected="True" />
+                    <ComboBoxItem Content="base" />
+                    <ComboBoxItem Content="small" />
+                    <ComboBoxItem Content="medium" />
+                    <ComboBoxItem Content="large" />
+                </ComboBox>
+                <TextBlock Text="Устройство:" Foreground="White" FontSize="12" Margin="2,8,0,4" />
+                <ComboBox x:Name="DeviceComboBox" Width="212" Height="28">
+                    <ComboBoxItem Content="cpu" IsSelected="True" />
+                    <ComboBoxItem Content="cuda" />
+                </ComboBox>
+            </StackPanel>
+
+            <!-- Neural aligner tools (hidden) -->
+            <Button x:Name="GenerateSamplesButton" Content="Сгенерировать примеры" Margin="0,12,0,6" Width="212" Height="40" FontSize="14" Visibility="Collapsed" />
+            <Button x:Name="TrainModelButton" Content="Обучить модель" Margin="0,0,0,6" Width="212" Height="40" FontSize="14" Visibility="Collapsed" />
+            <Button x:Name="UseNeuralAlignButton" Content="Использовать нейрон" Margin="0,0,0,6" Width="212" Height="40" FontSize="14" Visibility="Collapsed" />
             <Button x:Name="InstallDepsButton" Content="Установить зависимости (Python)" Margin="0,6,0,6" Width="212" Height="40" FontSize="14" />
 
             <!-- Dependency install progress UI -->

@@ -6,6 +6,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--audio', '-a', required=True)
 parser.add_argument('--text', '-t', required=True)
 parser.add_argument('--model', '-m', default='small')
+parser.add_argument('--device', '-d', default='cpu')
 args = parser.parse_args()
 
 try:
@@ -18,15 +19,30 @@ except Exception as e:
 audio = args.audio
 text_path = args.text
 model_name = args.model
+device = args.device
 
 try:
-    model = whisper.load_model(model_name)
+    # try loading whisper model with device argument, fallback if not supported
+    try:
+        model = whisper.load_model(model_name, device=device)
+    except TypeError:
+        model = whisper.load_model(model_name)
+
     result = model.transcribe(audio)
-    # load alignment model
-    device = "cpu"
-    model_a, metadata = whisperx.load_align_model(device)
-    # perform alignment
-    result_aligned = whisperx.align(result["segments"], model_a, metadata, audio, return_word_timestamps=True)
+
+    # load alignment model (some versions accept device, others don't)
+    try:
+        model_a, metadata = whisperx.load_align_model(device)
+    except TypeError:
+        model_a, metadata = whisperx.load_align_model()
+
+    # perform alignment; try align without device named arg first, then with device if needed
+    segments = result.get("segments", [])
+    try:
+        result_aligned = whisperx.align(segments, model_a, metadata, audio, return_word_timestamps=True)
+    except TypeError:
+        result_aligned = whisperx.align(segments, model_a, metadata, audio, device=device, return_word_timestamps=True)
+
     # result_aligned contains 'word_segments' key with word timestamps in whisperx API
     words = []
     if isinstance(result_aligned, dict) and "word_segments" in result_aligned:

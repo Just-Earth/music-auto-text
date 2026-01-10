@@ -16,6 +16,8 @@ using System.Linq;
 using System.Threading;
 using System.Text.RegularExpressions;
 using System.Diagnostics;
+using System.Net.Http;
+using System.IO.Compression;
 
 // Alias for VLC player
 using VlcPlayerType = LibVLCSharp.Shared.MediaPlayer;
@@ -343,7 +345,9 @@ namespace WpfApp1
                 // try whisper forced-align flow
                 try
                 {
-                    var segments = await _whisperClient.TranscribeAsync(_pendingFilePath ?? string.Empty, "small");
+                    var modelName = GetSelectedWhisperModel();
+                    var device = GetSelectedDevice();
+                    var segments = await _whisperClient.TranscribeAsync(_pendingFilePath ?? string.Empty, modelName, device);
                     if (segments != null && segments.Count > 0)
                     {
                         // build a word-level list from segments
@@ -1105,6 +1109,7 @@ namespace WpfApp1
             catch { }
         }
 
+        // XAML event handlers for volume container hover (must match names in XAML)
         private void VolumeContainer_MouseEnter(object sender, MouseEventArgs e)
         {
             OpenVolumePopup();
@@ -1113,6 +1118,44 @@ namespace WpfApp1
         private void VolumeContainer_MouseLeave(object sender, MouseEventArgs e)
         {
             CloseVolumePopupIfAppropriate();
+        }
+
+        // Helper: get selected whisper model from UI if present, otherwise default to "small"
+        private string GetSelectedWhisperModel()
+        {
+            try
+            {
+                var cmb = this.FindName("WhisperModelCombo") as System.Windows.Controls.ComboBox;
+                if (cmb != null)
+                {
+                    if (cmb.SelectedItem != null) return cmb.SelectedItem.ToString() ?? "small";
+                    if (cmb.Text != null && cmb.Text.Length > 0) return cmb.Text;
+                }
+
+                var tb = this.FindName("WhisperModelTextBox") as System.Windows.Controls.TextBox;
+                if (tb != null && !string.IsNullOrWhiteSpace(tb.Text)) return tb.Text.Trim();
+            }
+            catch { }
+            return "small";
+        }
+
+        // Helper: get selected device from UI if present, otherwise default to "cpu"
+        private string GetSelectedDevice()
+        {
+            try
+            {
+                var cmb = this.FindName("DeviceCombo") as System.Windows.Controls.ComboBox;
+                if (cmb != null)
+                {
+                    if (cmb.SelectedItem != null) return cmb.SelectedItem.ToString() ?? "cpu";
+                    if (cmb.Text != null && cmb.Text.Length > 0) return cmb.Text;
+                }
+
+                var tb = this.FindName("DeviceTextBox") as System.Windows.Controls.TextBox;
+                if (tb != null && !string.IsNullOrWhiteSpace(tb.Text)) return tb.Text.Trim();
+            }
+            catch { }
+            return "cpu";
         }
 
         private void VolumeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
@@ -1149,49 +1192,71 @@ namespace WpfApp1
 
             try
             {
-                // step 1: check python
                 DepsStatusText.Text = "Проверка python...";
                 await Task.Delay(200);
-                var pythonCheck = await RunCommandAsync("python", "-m pip --version");
-                DepsProgressBar.Value = 10;
+                var pythonCheck = await RunCommandAsync("python", "--version");
+                DepsProgressBar.Value = 5;
 
-                // step 2: upgrade pip
-                DepsStatusText.Text = "Обновление pip...";
-                await Task.Delay(200);
-                await RunCommandAsync("python", "-m pip install --upgrade pip");
-                DepsProgressBar.Value = 35;
+                // upgrade pip and install common packages
+                DepsStatusText.Text = "Обновление pip и установка базовых пакетов...";
+                await RunCommandAsync("python", "-m pip install --upgrade pip setuptools wheel");
+                DepsProgressBar.Value = 15;
+                await RunCommandAsync("python", "-m pip install -U numpy scipy soundfile ffmpeg-python tqdm");
+                DepsProgressBar.Value = 30;
 
-                // step 3: install openai-whisper
+                // install openai-whisper
                 DepsStatusText.Text = "Установка openai-whisper...";
-                await Task.Delay(200);
                 await RunCommandAsync("python", "-m pip install -U openai-whisper");
-                DepsProgressBar.Value = 60;
+                DepsProgressBar.Value = 55;
 
-                // step 4: install whisperX
-                DepsStatusText.Text = "Установка whisperX (через git)...";
-                await Task.Delay(200);
+                // install whisperX (alignment) optionally
+                DepsStatusText.Text = "Установка whisperX (опционально)...";
                 await RunCommandAsync("python", "-m pip install -U git+https://github.com/m-bain/whisperX.git");
-                DepsProgressBar.Value = 80;
+                DepsProgressBar.Value = 70;
 
-                // step 5: install CPU torch
+                // install torch (CPU by default)
                 DepsStatusText.Text = "Установка torch (CPU)...";
-                await Task.Delay(200);
                 await RunCommandAsync("python", "-m pip install --index-url https://download.pytorch.org/whl/cpu torch");
-                DepsProgressBar.Value = 100;
+                DepsProgressBar.Value = 85;
 
+                // ensure ffmpeg available: check and download into app folder if missing
+                bool ffmpegOk = true;
+                try
+                {
+                    var ffout = await RunCommandAsync("ffmpeg", "-version");
+                    ffmpegOk = !string.IsNullOrWhiteSpace(ffout);
+                }
+                catch { ffmpegOk = false; }
+
+                if (!ffmpegOk)
+                {
+                    DepsStatusText.Text = "Загрузка ffmpeg (может занять время)...";
+                    var target = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ffmpeg");
+                    try
+                    {
+                        await DownloadAndExtractFfmpegAsync(target);
+                        DepsProgressBar.Value = 95;
+                        DepsStatusText.Text = "ffmpeg установлен в папке приложения.";
+                    }
+                    catch (Exception ex)
+                    {
+                        DepsStatusText.Text = "Не удалось установить ffmpeg: " + ex.Message;
+                    }
+                }
+
+                DepsProgressBar.Value = 100;
                 DepsStatusText.Text = "Установлено. Возможен перезапуск приложения.";
-                MessageBox.Show("Зависимости установлены. Возможно потребуется перезапуск приложения.");
+                MessageBox.Show("Зависимости установлены. Возможно потребуется перезапуск приложения.", "Готово", MessageBoxButton.OK, MessageBoxImage.Information);
             }
             catch (Exception ex)
             {
                 DepsStatusText.Text = "Ошибка: " + ex.Message.Replace("\n", " ");
-                MessageBox.Show("Ошибка установки: " + ex.Message);
+                MessageBox.Show("Ошибка установки: " + ex.Message, "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
             }
             finally
             {
                 InstallDepsButton.IsEnabled = true;
                 InstallDepsButton.Content = "Установить зависимости (Python)";
-                // hide progress after short delay
                 await Task.Delay(1200);
                 DepsProgressPanel.Visibility = Visibility.Collapsed;
             }
@@ -1215,6 +1280,36 @@ namespace WpfApp1
             await p.WaitForExitAsync();
             if (p.ExitCode != 0) throw new Exception(errStr + "\n" + outStr);
             return outStr;
+        }
+
+        private Task DownloadAndExtractFfmpegAsync(string targetFolder)
+        {
+            return Task.Run(() =>
+            {
+                try
+                {
+                    Directory.CreateDirectory(targetFolder);
+                    var url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+                    var zipPath = Path.Combine(targetFolder, "ffmpeg.zip");
+                    using (var http = new HttpClient())
+                    using (var resp = http.GetAsync(url).Result)
+                    {
+                        resp.EnsureSuccessStatusCode();
+                        using (var fs = File.Create(zipPath))
+                        {
+                            resp.Content.CopyToAsync(fs).Wait();
+                            fs.Close();
+                        }
+                    }
+
+                    ZipFile.ExtractToDirectory(zipPath, targetFolder, true);
+                    File.Delete(zipPath);
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception("Не удалось скачать или распаковать ffmpeg: " + ex.Message);
+                }
+            });
         }
 
         private async Task StartAutoResyncLoopAsync(CancellationToken token)

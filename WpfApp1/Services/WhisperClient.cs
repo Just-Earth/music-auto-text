@@ -17,7 +17,7 @@ namespace WpfApp1.Services
 
         public record Segment(double Start, double End, string Text);
 
-        public async Task<List<Segment>> TranscribeAsync(string audioPath, string model = "small")
+        public async Task<List<Segment>> TranscribeAsync(string audioPath, string model = "small", string device = "cpu")
         {
             var list = new List<Segment>();
             if (!File.Exists(_scriptPath)) throw new FileNotFoundException("whisper_transcribe.py not found", _scriptPath);
@@ -26,7 +26,7 @@ namespace WpfApp1.Services
             var psi = new ProcessStartInfo()
             {
                 FileName = "python",
-                Arguments = $"\"{_scriptPath}\" -i \"{audioPath}\" -m {model}",
+                Arguments = $"\"{_scriptPath}\" -i \"{audioPath}\" -m {model} -d {device}",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -79,7 +79,7 @@ namespace WpfApp1.Services
 
         public record WordInfo(double Start, double End, string Word);
 
-        public async Task<List<WordInfo>> TranscribeWithAlignmentAsync(string audioPath, string textPath, string model = "small")
+        public async Task<List<WordInfo>> TranscribeWithAlignmentAsync(string audioPath, string textPath, string model = "small", string device = "cpu")
         {
             var list = new List<WordInfo>();
             var script = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "whisper_forced_align.py");
@@ -90,7 +90,7 @@ namespace WpfApp1.Services
             var psi = new ProcessStartInfo()
             {
                 FileName = "python",
-                Arguments = $"\"{script}\" -a \"{audioPath}\" -t \"{textPath}\" -m {model}",
+                Arguments = $"\"{script}\" -a \"{audioPath}\" -t \"{textPath}\" -m {model} -d {device}",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
