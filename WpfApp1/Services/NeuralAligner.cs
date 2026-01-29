@@ -35,6 +35,9 @@ namespace WpfApp1.Services
             public double[] Bias1 { get; set; } = Array.Empty<double>();
             public double[] Weights2 { get; set; } = Array.Empty<double>();
             public double Bias2 { get; set; }
+            // feature normalization parameters saved with the model
+            public double[] Mean { get; set; } = Array.Empty<double>();
+            public double[] Std { get; set; } = Array.Empty<double>();
         }
 
         // Add a labeled training sample to DB (appends JSON line)
@@ -69,8 +72,39 @@ namespace WpfApp1.Services
             if (samples == null || samples.Count == 0) return false;
             int inputSize = samples[0].Features.Length;
             foreach (var s in samples) if (s.Features.Length != inputSize) return false; // inconsistent
-
             var rnd = new Random(0);
+
+            // compute feature normalization (mean/std)
+            var mean = new double[inputSize];
+            var std = new double[inputSize];
+            for (int j = 0; j < inputSize; j++)
+            {
+                double acc = 0;
+                for (int i = 0; i < samples.Count; i++) acc += samples[i].Features[j];
+                mean[j] = acc / samples.Count;
+            }
+            for (int j = 0; j < inputSize; j++)
+            {
+                double acc2 = 0;
+                for (int i = 0; i < samples.Count; i++)
+                {
+                    var d = samples[i].Features[j] - mean[j];
+                    acc2 += d * d;
+                }
+                std[j] = Math.Sqrt(Math.Max(1e-9, acc2 / samples.Count));
+            }
+
+            // normalize samples in-place for training
+            var normFeatures = new double[samples.Count][];
+            var labels = new int[samples.Count];
+            for (int i = 0; i < samples.Count; i++)
+            {
+                var f = samples[i].Features;
+                var nf = new double[inputSize];
+                for (int j = 0; j < inputSize; j++) nf[j] = (f[j] - mean[j]) / std[j];
+                normFeatures[i] = nf;
+                labels[i] = samples[i].Label > 0 ? 1 : 0;
+            }
             // initialize weights
             var W1 = new double[hiddenSize][];
             for (int i = 0; i < hiddenSize; i++)
@@ -91,8 +125,8 @@ namespace WpfApp1.Services
                 foreach (var idx in order)
                 {
                     var s = samples[idx];
-                    var x = s.Features;
-                    int y = s.Label > 0 ? 1 : 0;
+                    var x = normFeatures[idx];
+                    int y = labels[idx];
 
                     // forward
                     var h = new double[hiddenSize];
@@ -140,6 +174,7 @@ namespace WpfApp1.Services
                 Bias1 = b1,
                 Weights2 = W2,
                 Bias2 = b2
+                , Mean = mean, Std = std
             };
             File.WriteAllText(_modelPath, JsonSerializer.Serialize(model));
             return true;
@@ -167,21 +202,48 @@ namespace WpfApp1.Services
             int hidden = model.HiddenSize;
             int input = model.InputSize;
             var outArr = new double[features.Length];
+            // prepare normalization parameters
+            var mean = model.Mean ?? new double[input];
+            var std = model.Std ?? new double[input];
             for (int k = 0; k < features.Length; k++)
             {
                 var x = features[k];
                 if (x.Length != input) { outArr[k] = 0.0; continue; }
+                // normalize using stored mean/std
+                var xn = new double[input];
+                for (int j = 0; j < input; j++)
+                {
+                    var s = std.Length > j ? std[j] : 1.0;
+                    if (s == 0) s = 1.0;
+                    var m = mean.Length > j ? mean[j] : 0.0;
+                    xn[j] = (x[j] - m) / s;
+                }
                 var h = new double[hidden];
                 for (int i = 0; i < hidden; i++)
                 {
                     double sum = model.Bias1[i];
-                    for (int j = 0; j < input; j++) sum += model.Weights1[i][j] * x[j];
+                    for (int j = 0; j < input; j++) sum += model.Weights1[i][j] * xn[j];
                     h[i] = Math.Max(0.0, sum);
                 }
                 double z = model.Bias2;
                 for (int i = 0; i < hidden; i++) z += model.Weights2[i] * h[i];
                 outArr[k] = Sigmoid(z);
             }
+
+            // simple temporal smoothing (moving average) to reduce jitter
+            if (outArr.Length >= 3)
+            {
+                var smooth = new double[outArr.Length];
+                for (int i = 0; i < outArr.Length; i++)
+                {
+                    double acc = outArr[i]; int cnt = 1;
+                    if (i - 1 >= 0) { acc += outArr[i - 1]; cnt++; }
+                    if (i + 1 < outArr.Length) { acc += outArr[i + 1]; cnt++; }
+                    smooth[i] = acc / cnt;
+                }
+                return smooth;
+            }
+
             return outArr;
         }
 
@@ -263,11 +325,11 @@ namespace WpfApp1.Services
         }
 
         // Align text lines to audio using trained model: returns list of LyricsLine with timestamps and IsScream flag
-        public List<LyricsLine> AlignTextToAudioWithModel(string filePath, List<string> lines)
+        public List<LyricsLine> AlignTextToAudioWithModel(string filePath, List<string> lines, int windowMs = 50)
         {
             var outList = new List<LyricsLine>();
             if (lines == null || lines.Count == 0) return outList;
-            var (features, timestamps) = ExtractFeaturesFromFile(filePath);
+            var (features, timestamps) = ExtractFeaturesFromFile(filePath, windowMs);
             if (features.Length == 0) return outList;
 
             double[][] featArray = features.Select(f => f).ToArray();
@@ -288,12 +350,28 @@ namespace WpfApp1.Services
                 int start = Math.Max(0, estIdx - neighborhood);
                 int end = Math.Min(windows - 1, estIdx + neighborhood);
 
-                // find index with max probability in [start,end]
-                int best = start; double bestP = probs[start];
-                for (int w = start; w <= end; w++) if (probs[w] > bestP) { bestP = probs[w]; best = w; }
+                // find index with best adjusted score in [start,end]
+                int best = estIdx; double bestScore = double.NegativeInfinity; double bestP = 0.0;
+                double penaltyFactor = 0.5; // penalize earlier windows
+                for (int w = start; w <= end; w++)
+                {
+                    // prefer indices at or after estIdx to avoid "rushing" earlier
+                    double penalty = 0.0;
+                    if (w < estIdx)
+                    {
+                        penalty = penaltyFactor * (double)(estIdx - w) / (double)neighborhood;
+                    }
+                    double score = probs[w] - penalty;
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        best = w;
+                        bestP = probs[w];
+                    }
+                }
 
                 // fallback: if all probs low, use estIdx
-                if (bestP < 0.05) { best = estIdx; }
+                if (bestP < 0.05) { best = estIdx; bestP = probs[Math.Max(0, Math.Min(estIdx, probs.Length - 1))]; }
 
                 double timeSec = timestamps[Math.Max(0, Math.Min(best, timestamps.Length - 1))];
                 var isScream = bestP > 0.8 && features[best][0] > 0.2; // heuristic: high prob & high RMS

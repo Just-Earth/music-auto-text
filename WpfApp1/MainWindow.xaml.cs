@@ -31,6 +31,7 @@ namespace WpfApp1
 
         private readonly LyricsService _lyricsService = new LyricsService();
         private List<LyricsLine> _currentLyrics = new List<LyricsLine>();
+        private int _currentLyricIndex = -1;
         private bool _isPlaying = false;
 
         private LibVLC? _libVLC;
@@ -44,8 +45,8 @@ namespace WpfApp1
         // seek state
         private bool _isSeeking = false;
 
-        // button-open state
-        private bool _wasOpenedByButton = false;
+        // whether the volume popup was opened by clicking the button (persist open)
+        private bool _popupPersistOpen = false;
 
         // startup latency for playback
         private double _playbackStartupLatencyMs = 0.0;
@@ -56,7 +57,24 @@ namespace WpfApp1
         private CancellationTokenSource? _resyncCts;
         private bool _autoResyncEnabled = true; // enabled by default
 
-        private WhisperClient? _whisperClient = null;
+        // Whisper usage
+
+        // Real-time music info service
+        private MusicInfoService? _musicInfoService = null;
+        private bool _realTimeEnabled = false;
+
+        private RealTimeAudioService? _realTimeAudio = null;
+        private bool _inMp3Mode = false;
+        private MediaSessionWatcher? _mediaWatcher = null;
+        private Action<string, string, string, string?>? _mediaWatcherHandler = null;
+        // current playback state reported by system media session (true == playing)
+        private bool _systemIsPlaying = false;
+        // previous band values for smoothing the visualizer
+        private double[]? _prevBands = null;
+        // (removed unused WhisperClient field)
+        // debug UI toggle removed
+        // cancellation for concurrent cover image loads
+        private CancellationTokenSource? _coverLoadCts = null;
 
         // Neural aligner optional
         private NeuralAligner? _neuralAligner = null;
@@ -66,7 +84,7 @@ namespace WpfApp1
         {
             InitializeComponent();
 
-            _whisperClient = new WhisperClient();
+            // whisper client removed
 
             // ensure ProgressCanvas events wired in case XAML not loaded handlers
             ProgressCanvas.MouseLeftButtonDown += ProgressCanvas_MouseLeftButtonDown;
@@ -82,7 +100,7 @@ namespace WpfApp1
             // Initialize LibVLC for audio playback
             Core.Initialize();
             _libVLC = new LibVLC();
-            _vlcPlayer = new VlcPlayerType(_libVLC);
+            _vlcPlayer = new VlcPlayerType(_libVLC!);
             _vlcPlayer.EndReached += VlcPlayer_EndReached;
 
             LoadMp3Button.Click += LoadMp3Button_Click;
@@ -95,6 +113,83 @@ namespace WpfApp1
 
             PlayPauseBottomButton.Click += PlayPauseButton_Click;
             BackButton.Click += BackButton_Click;
+
+            // real-time audio visualizer service
+            _realTimeAudio = new RealTimeAudioService(1024);
+            _realTimeAudio.OnBandsReady += RealTimeAudio_OnBandsReady;
+
+            // media session watcher (WinRT GSSM) - lazy start
+            try
+            {
+                _mediaWatcher = new MediaSessionWatcher();
+                _ = _mediaWatcher.StartAsync();
+                _mediaWatcherHandler = (title, artist, album, coverPath) =>
+                {
+                    // update UI only when we are NOT in MP3 mode and not playing local media
+                    Dispatcher.Invoke(() =>
+                    {
+                        if (!_inMp3Mode && !_isPlaying)
+                        {
+                            if (string.IsNullOrWhiteSpace(title))
+                            {
+                                SongTitleText.Text = string.Empty;
+                                WallpaperTitleText.Text = string.Empty;
+                                AlbumCoverImage.Source = null;
+                                WallpaperCoverImage.Source = null;
+                            }
+                            else
+                            {
+                                SongTitleText.Text = string.IsNullOrWhiteSpace(artist) ? title : $"{artist} - {title}";
+                                WallpaperTitleText.Text = SongTitleText.Text;
+                                // if SMTC provided a saved cover path, load it (coverPath currently null on some platforms)
+                                if (!string.IsNullOrWhiteSpace(coverPath))
+                                {
+                                    try
+                                    {
+                                        if (File.Exists(coverPath))
+                                        {
+                                            var bi = new System.Windows.Media.Imaging.BitmapImage();
+                                            bi.BeginInit();
+                                            bi.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
+                                            bi.UriSource = new Uri(coverPath);
+                                            bi.EndInit();
+                                            bi.Freeze();
+                                            AlbumCoverImage.Source = bi;
+                                            WallpaperCoverImage.Source = bi;
+                                            WallpaperPanel.Visibility = Visibility.Visible;
+                                        }
+                                    }
+                                    catch { }
+                                }
+                            }
+                        }
+                    });
+                };
+                _mediaWatcher.OnMediaChanged += _mediaWatcherHandler;
+                // subscribe to playback state changes so we can silence visualizer when system playback is paused
+                try
+                {
+                    _mediaWatcher.OnPlaybackStateChanged += (isPlaying) =>
+                    {
+                        _systemIsPlaying = isPlaying;
+                        // If system paused and we're not playing local MP3, clear visualizer
+                        if (!_inMp3Mode && !_isPlaying && !_systemIsPlaying)
+                        {
+                            try { Dispatcher.Invoke(() => AudioVisualizerCanvas.Children.Clear()); } catch { }
+                        }
+                    };
+                }
+                catch { }
+                // also start MusicInfoService as a fallback/cover lookup service
+                try
+                {
+                    _musicInfoService ??= new MusicInfoService();
+                    _musicInfoService.OnMusicChanged += MusicInfoService_OnMusicChanged;
+                    _musicInfoService.StartListening();
+                }
+                catch { }
+            }
+            catch { }
 
             // install deps button hookup
             InstallDepsButton.Click += InstallDepsButton_Click;
@@ -110,6 +205,11 @@ namespace WpfApp1
             GenerateSamplesButton.Click += GenerateSamplesButton_Click;
             TrainModelButton.Click += TrainModelButton_Click;
             UseNeuralAlignButton.Click += UseNeuralAlignButton_Click;
+            // mini aligner UI hooks
+            var useMini = this.FindName("UseMiniAlignCheck") as CheckBox;
+            if (useMini != null) useMini.Checked += (s,e) => { /* noop */ };
+            var exportBtn = this.FindName("ExportFeaturesButton") as Button;
+            if (exportBtn != null) exportBtn.Click += ExportFeaturesButton_Click;
             // reflect initial state
             UseNeuralAlignButton.Content = "Использовать нейрон: выкл";
 
@@ -195,7 +295,9 @@ namespace WpfApp1
                 UpdateCustomProgress(pos);
 
                 var current = TimeSpan.FromMilliseconds(_vlcPlayer.Time);
-                ApplyIntensityToLyricsStatic(current);
+                // Use timestamp-based active-line detection (no word-level tracking)
+                _currentLyricIndex = LyricsLine.FindActiveLineIndex(_currentLyrics, current, _currentLyricIndex, TimeSpan.FromSeconds(3));
+                ApplyIntensityToLyricsByIndex(_currentLyricIndex);
 
                 // update time texts
                 ProgressCurrentText.Text = FormatTime(current);
@@ -236,6 +338,8 @@ namespace WpfApp1
                 PlayPauseBottomButton.Content = "⏸";
                 _progressTimer.Start();
 
+                    // live transcriber removed — no action
+
                 // resume resync
                 if (_autoResyncEnabled)
                 {
@@ -259,7 +363,27 @@ namespace WpfApp1
                 // Update UI immediately: hide left column and show player chrome
                 Dispatcher.Invoke(() =>
                 {
-                    SongTitleText.Text = System.IO.Path.GetFileNameWithoutExtension(path);
+                    var parsedTitle = ParseFilenameForArtistTitle(path);
+                    // prefer artist - title if parsed, otherwise filename
+                    if (!string.IsNullOrWhiteSpace(parsedTitle.artist) || !string.IsNullOrWhiteSpace(parsedTitle.title))
+                    {
+                        SongTitleText.Text = string.IsNullOrWhiteSpace(parsedTitle.artist) ? parsedTitle.title : $"{parsedTitle.artist} - {parsedTitle.title}";
+                    }
+                    else
+                    {
+                        SongTitleText.Text = System.IO.Path.GetFileNameWithoutExtension(path);
+                    }
+                    // stop real-time music info to avoid overwriting title
+                    try
+                    {
+                        if (_musicInfoService != null)
+                        {
+                            _musicInfoService.OnMusicChanged -= MusicInfoService_OnMusicChanged;
+                            _musicInfoService.StopListening();
+                        }
+                    }
+                    catch { }
+                    try { _realTimeAudio?.Stop(); AudioVisualizerCanvas.Visibility = Visibility.Collapsed; } catch { }
                     LeftButtonsPanel.Visibility = Visibility.Collapsed;
                     // collapse the left column so the player area uses the full window
                     if (RootGrid.ColumnDefinitions.Count > 0)
@@ -277,31 +401,19 @@ namespace WpfApp1
                     // Start logo move storyboard dynamically
                     StartLogoAnimation();
 
-                    // Show lyrics input overlay
+                    // autofill artist/title and show overlay for user acceptance
+                    var parsed = ParseFilenameForArtistTitle(path);
+                    ArtistTextBox.Text = parsed.artist;
+                    TitleTextBox.Text = parsed.title;
+                    // keep _pendingFilePath for later processing
+                    _pendingFilePath = path;
+                _inMp3Mode = true;
+                    // show the lyrics input overlay so the user can confirm artist/title
                     LyricsInputOverlay.Visibility = Visibility.Visible;
-                    LyricsNotFoundPanel.Visibility = Visibility.Collapsed;
-
-                    // prefill artist/title from filename if possible
-                    var (artist, title) = ParseFilenameForArtistTitle(path);
-                    ArtistTextBox.Text = artist;
-                    TitleTextBox.Text = title;
                 });
 
-                try
-                {
-                    // stop previous
-                    _vlcPlayer?.Stop();
-                    _pendingMedia?.Dispose();
-
-                    _pendingMedia = new Media(_libVLC!, new Uri(path));
-
-                    // do NOT start playing immediately; wait until user loads lyrics or chooses to continue
-                }
-                catch
-                {
-                    MessageBox.Show("Failed to open media.");
-                }
-
+                // do not auto-start playback here; wait for user to accept lyrics from Lyrics.ovh
+                return;
             }
         }
 
@@ -316,170 +428,7 @@ namespace WpfApp1
             return (string.Empty, filename);
         }
 
-        private async void LoadLyricsButton_Click(object? sender, RoutedEventArgs e)
-        {
-            var artist = ArtistTextBox.Text?.Trim() ?? string.Empty;
-            var title = TitleTextBox.Text?.Trim() ?? string.Empty;
-            if (string.IsNullOrWhiteSpace(artist) || string.IsNullOrWhiteSpace(title))
-            {
-                MessageBox.Show("Введите артиста и название трека.");
-                return;
-            }
-
-            // attempt to fetch from lyrics.ovh
-            LyricsInputOverlay.IsEnabled = false;
-            var raw = await _lyricsService.FetchLyricsRawByArtistTitleAsync(artist, title);
-            LyricsInputOverlay.IsEnabled = true;
-
-            if (!string.IsNullOrWhiteSpace(raw))
-            {
-                // use original lyric lines instead of fixed 5-word chunks
-                var lines = raw.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
-                               .Select(l => l.Trim())
-                               .Where(l => !string.IsNullOrWhiteSpace(l))
-                               .ToList();
-
-                _currentLyrics.Clear();
-
-                List<LyricsLine> aligned = null;
-                // try whisper forced-align flow
-                try
-                {
-                    var modelName = GetSelectedWhisperModel();
-                    var device = GetSelectedDevice();
-                    var segments = await _whisperClient.TranscribeAsync(_pendingFilePath ?? string.Empty, modelName, device);
-                    if (segments != null && segments.Count > 0)
-                    {
-                        // build a word-level list from segments
-                        var wordTimes = new List<(string word, double start, double end)>();
-                        foreach (var seg in segments)
-                        {
-                            var words = Regex.Split(seg.Text.Trim(), "\\s+") .Where(w => !string.IsNullOrWhiteSpace(w)).ToArray();
-                            if (words.Length == 0) continue;
-                            double segStart = seg.Start; double segEnd = seg.End;
-                            double dur = segEnd - segStart;
-                            for (int wi = 0; wi < words.Length; wi++)
-                            {
-                                double wstart = segStart + (dur * wi) / words.Length;
-                                double wend = segStart + (dur * (wi + 1)) / words.Length;
-                                wordTimes.Add((words[wi], wstart, wend));
-                            }
-                        }
-
-                        // map lines (which may be phrases) to earliest word time that contains matching words
-                        for (int i = 0; i < lines.Count; i++)
-                        {
-                            var ln = lines[i];
-                            var lnWords = Regex.Split(ln, "\\s+").Where(w => !string.IsNullOrWhiteSpace(w)).Select(w => w.Trim(new char[]{',','.', '"','\'','!','?'}).ToLower()).ToList();
-                            double chosen = 0.0; bool found = false; bool scream = false;
-                            for (int wi = 0; wi < wordTimes.Count; wi++)
-                            {
-                                var wt = wordTimes[wi];
-                                var wclean = wt.word.Trim(new char[]{',','.', '"','\'','!','?'}).ToLower();
-                                if (lnWords.Contains(wclean))
-                                {
-                                    chosen = wt.start; found = true;
-                                    // detect scream by checking if word period overlaps a high-energy window (use earlier RMS features)
-                                    // simple heuristic: if word chunk duration < 0.5s and uppercase letters exist assume shout
-                                    if (wt.word.Any(c => char.IsUpper(c)) || wt.end - wt.start < 0.35) scream = true;
-                                    break;
-                                }
-                            }
-                            if (!found)
-                            {
-                                // fallback to previous alignment methods
-                            }
-                            _currentLyrics.Add(new LyricsLine { Timestamp = TimeSpan.FromSeconds(chosen), Text = ln, IsScream = scream });
-                        }
-                    }
-                }
-                catch { aligned = null; }
-
-                // If whisper didn't produce useful alignment, optionally try neural aligner if enabled
-                if ((_currentLyrics == null || _currentLyrics.Count == 0) && _useNeuralAligner && !string.IsNullOrWhiteSpace(_pendingFilePath) && File.Exists(_pendingFilePath))
-                {
-                    try
-                    {
-                        _neuralAligner ??= new NeuralAligner();
-                        var model = _neuralAligner.LoadModel();
-                        if (model != null)
-                        {
-                            var neural = await Task.Run(() => _neuralAligner.AlignTextToAudioWithModel(_pendingFilePath!, lines));
-                            if (neural != null && neural.Count > 0)
-                            {
-                                _currentLyrics = neural;
-                            }
-                        }
-                        else
-                        {
-                            // model not present - inform user
-                            MessageBox.Show("Модель нейронной сети не найдена. Выключите использование нейрона или обучите модель.", "Инфо", MessageBoxButton.OK, MessageBoxImage.Information);
-                        }
-                    }
-                    catch { }
-                }
-
-                if (aligned != null && aligned.Count == lines.Count)
-                {
-                    _currentLyrics = aligned;
-                }
-
-                // if no alignment was produced, fall back to using the raw lines or estimated timestamps
-                if (_currentLyrics == null || _currentLyrics.Count == 0)
-                {
-                    // try to estimate timestamps for each line from audio
-                    List<TimeSpan>? estimates = null;
-                    if (!string.IsNullOrWhiteSpace(_pendingFilePath) && File.Exists(_pendingFilePath))
-                    {
-                        try
-                        {
-                            estimates = await _lyricsService.EstimateTimestampsFromAudioAsync(_pendingFilePath, lines.Count);
-                        }
-                        catch { estimates = null; }
-                    }
-
-                    if (estimates != null && estimates.Count == lines.Count)
-                    {
-                        for (int i = 0; i < lines.Count; i++)
-                        {
-                            _currentLyrics.Add(new LyricsLine { Timestamp = estimates[i], Text = lines[i] });
-                        }
-                    }
-                    else
-                    {
-                        // fallback: place lines uniformly across the track (or short fixed spacing)
-                        double chunkSeconds = 2.0;
-                        if (_vlcPlayer != null && _vlcPlayer.Length > 0 && lines.Count > 0)
-                        {
-                            var totalSec = _vlcPlayer.Length / 1000.0;
-                            chunkSeconds = Math.Max(0.25, totalSec / lines.Count);
-                        }
-
-                        var t = TimeSpan.Zero;
-                        foreach (var ln in lines)
-                        {
-                            _currentLyrics.Add(new LyricsLine { Timestamp = t, Text = ln });
-                            t = t.Add(TimeSpan.FromSeconds(chunkSeconds));
-                        }
-                    }
-                }
-
-                // ensure sorted
-                _currentLyrics = _currentLyrics.OrderBy(x => x.Timestamp).ToList();
-
-                // render and hide overlay
-                RenderLyrics(_currentLyrics);
-                LyricsInputOverlay.Visibility = Visibility.Collapsed;
-
-                // start playback flow (delayed so animations complete)
-                await StartPlaybackAfterLyricsLoadedAsync();
-            }
-            else
-            {
-                // show not found options
-                LyricsNotFoundPanel.Visibility = Visibility.Visible;
-            }
-        }
+        
 
         private async Task StartPlaybackAfterLyricsLoadedAsync()
         {
@@ -558,6 +507,89 @@ namespace WpfApp1
             LyricsNotFoundPanel.Visibility = Visibility.Collapsed;
         }
 
+        private async void LoadLyricsButton_Click(object? sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var artist = ArtistTextBox.Text?.Trim() ?? string.Empty;
+                var title = TitleTextBox.Text?.Trim() ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(_pendingFilePath)) return;
+
+                // try lyrics.ovh first
+                string? raw = null;
+                try
+                {
+                    raw = await _lyricsService.FetchLyricsRawByArtistTitleAsync(artist, title);
+                }
+                catch { raw = null; }
+
+                if (!string.IsNullOrWhiteSpace(raw))
+                {
+                    _currentLyrics = _lyricsService.ParseLyricsToLines(raw);
+                }
+                else
+                {
+                    // If Lyrics.ovh didn't return text, require user action — show not-found panel and abort automatic processing.
+                    LyricsNotFoundPanel.Visibility = Visibility.Visible;
+                    return;
+                }
+
+                // Attempt forced-alignment: create a temporary text file with the lyrics and ask Whisper to align words
+                string? tempTextFile = null;
+                try
+                {
+                    // write lines to temp file
+                    tempTextFile = System.IO.Path.Combine(System.IO.Path.GetTempPath(), Guid.NewGuid().ToString() + ".txt");
+                    var linesText = string.Join("\n", _currentLyrics.Select(l => l.Text));
+                    System.IO.File.WriteAllText(tempTextFile, linesText);
+
+                    try
+                    {
+                        var wcAlign = new WhisperClient();
+                        var model = ModelComboBox.SelectedValue as string ?? "small";
+                        var device = DeviceComboBox.SelectedValue as string ?? "cpu";
+                        var words = await wcAlign.TranscribeWithAlignmentAsync(_pendingFilePath!, tempTextFile, model, device);
+                        if (words != null && words.Count > 0)
+                        {
+                            // align lines by first word
+                            _lyricsService.AlignLinesByFirstWord(_currentLyrics, words);
+                        }
+                    }
+                    catch
+                    {
+                        // alignment failed - keep existing timestamps
+                    }
+                }
+                finally
+                {
+                    try { if (!string.IsNullOrWhiteSpace(tempTextFile) && System.IO.File.Exists(tempTextFile)) System.IO.File.Delete(tempTextFile); } catch { }
+                }
+
+                LyricsInputOverlay.Visibility = Visibility.Collapsed;
+                RenderLyrics(_currentLyrics);
+                // prepare media and start playback
+                try
+                {
+                    // stop previous
+                    _vlcPlayer?.Stop();
+                    _pendingMedia?.Dispose();
+                    if (!string.IsNullOrWhiteSpace(_pendingFilePath))
+                    {
+                        _pendingMedia = new Media(_libVLC!, new Uri(_pendingFilePath));
+                    }
+                    if (_vlcPlayer == null)
+                    {
+                        _vlcPlayer = new VlcPlayerType(_libVLC!);
+                        _vlcPlayer.EndReached += VlcPlayer_EndReached;
+                    }
+                }
+                catch { }
+
+                await StartPlaybackAfterLyricsLoadedAsync();
+            }
+            catch { LyricsInputOverlay.Visibility = Visibility.Collapsed; }
+        }
+
         private async void ContinueNoLyricsButton_Click(object? sender, RoutedEventArgs e)
         {
             // hide overlay and proceed without lyrics (use fallback from filename)
@@ -624,6 +656,23 @@ namespace WpfApp1
             RenderLyrics(_currentLyrics);
 
             // start playback flow
+            try
+            {
+                // prepare media and player
+                _vlcPlayer?.Stop();
+                _pendingMedia?.Dispose();
+                if (!string.IsNullOrWhiteSpace(_pendingFilePath))
+                {
+                    _pendingMedia = new Media(_libVLC!, new Uri(_pendingFilePath));
+                }
+                if (_vlcPlayer == null)
+                {
+                    _vlcPlayer = new VlcPlayerType(_libVLC!);
+                    _vlcPlayer.EndReached += VlcPlayer_EndReached;
+                }
+            }
+            catch { }
+
             _ = StartPlaybackAfterLyricsLoadedAsync();
         }
 
@@ -636,6 +685,8 @@ namespace WpfApp1
             _pendingMedia?.Dispose();
             _pendingMedia = null;
             _isPlaying = false;
+
+            _inMp3Mode = false;
 
             // restore UI
             ProgressAreaGrid.Visibility = Visibility.Collapsed;
@@ -682,8 +733,8 @@ namespace WpfApp1
 
         private void CancelLyricsButton_Click(object? sender, RoutedEventArgs e)
         {
-            // treat cancel as continue without lyrics
-            ContinueNoLyricsButton_Click(sender, e);
+            // close overlay and do nothing
+            LyricsInputOverlay.Visibility = Visibility.Collapsed;
         }
 
         private void StartLogoAnimation()
@@ -763,7 +814,7 @@ namespace WpfApp1
             };
         }
 
-        private void BackButton_Click(object sender, RoutedEventArgs e)
+        private void BackButton_Click(object sender, RoutedEventArgs? e)
         {
             // stop playback and return to main menu
             _vlcPlayer?.Stop();
@@ -788,6 +839,37 @@ namespace WpfApp1
 
             // clear displayed song title/artist
             SongTitleText.Text = string.Empty;
+            WallpaperTitleText.Text = string.Empty;
+            // reset background and covers immediately
+            try
+            {
+                // only reset to black when not in Real Time mode; in Real Time we want the blurred cover background
+                if (!_realTimeEnabled)
+                {
+                    StaticBackgroundRect.Fill = new SolidColorBrush(System.Windows.Media.Colors.Black);
+                }
+            }
+            catch { }
+
+            // stop real-time services and hide visual elements
+            try
+            {
+                if (_musicInfoService != null)
+                {
+                    _musicInfoService.OnMusicChanged -= MusicInfoService_OnMusicChanged;
+                    _musicInfoService.StopListening();
+                }
+            }
+            catch { }
+            try { _realTimeAudio?.Stop(); } catch { }
+            AudioVisualizerCanvas.Visibility = Visibility.Collapsed;
+            AlbumCoverImage.Visibility = Visibility.Collapsed;
+            AlbumCoverImageLeft.Source = null;
+            AlbumCoverImageLeft.Visibility = Visibility.Collapsed;
+            WallpaperPanel.Visibility = Visibility.Collapsed;
+
+            // detach media watcher handler
+            try { if (_mediaWatcher != null && _mediaWatcherHandler != null) _mediaWatcher.OnMediaChanged -= _mediaWatcherHandler; } catch { }
 
             // restore left column and show main buttons
             if (RootGrid.ColumnDefinitions.Count > 0)
@@ -796,6 +878,9 @@ namespace WpfApp1
             }
             LeftButtonsPanel.Visibility = Visibility.Visible;
             LyricsPanel.Children.Clear();
+
+            // reset mp3 mode flag so system sessions can update title again
+            _inMp3Mode = false;
 
             _progressTimer.Stop();
 
@@ -840,8 +925,15 @@ namespace WpfApp1
 
             foreach (var line in lyrics)
             {
-                var tb = new TextBlock { Text = line.Text, Foreground = line.IsScream ? Brushes.Red : Brushes.White, FontSize = 24, Margin = new Thickness(4), Opacity = 1.0, Tag = line, TextWrapping = TextWrapping.Wrap };
-                if (line.IsScream) { tb.FontWeight = FontWeights.Bold; }
+                var tb = new TextBlock { Text = line.Text, Tag = line };
+                // apply default style
+                tb.Style = (Style)TryFindResource("LyricLineStyle");
+                if (line.IsScream)
+                {
+                    tb.Foreground = Brushes.Red;
+                    tb.FontWeight = FontWeights.Bold;
+                    tb.Opacity = 1.0;
+                }
                 LyricsPanel.Children.Add(tb);
             }
 
@@ -867,34 +959,71 @@ namespace WpfApp1
             // apply automatic offset
             adjusted = adjusted.Add(TimeSpan.FromMilliseconds(-_autoSyncOffsetMs));
 
-            // highlight nearest lyrics line without dynamic intensity styling
-            LyricsLine? nearest = null;
-            foreach (var l in _currentLyrics)
-            {
-                if (l.Timestamp <= adjusted) nearest = l;
-                else break;
-            }
-            if (nearest == null) return;
+            // Deprecated: word-level tracking removed. Keep simple highlighting by index.
+            // No-op here; use ApplyIntensityToLyricsByIndex instead.
+        }
 
-            foreach (var child in LyricsPanel.Children)
+        private void ApplyIntensityToLyricsByIndex(int index)
+        {
+            for (int i = 0; i < LyricsPanel.Children.Count; i++)
             {
+                var child = LyricsPanel.Children[i];
                 if (child is TextBlock tb)
                 {
-                    if (tb.Tag is LyricsLine ll && ll == nearest)
+                    if (i == index)
                     {
-                        tb.FontWeight = FontWeights.Bold;
-                        tb.Foreground = Brushes.White;
-                        tb.Opacity = 1.0;
+                        tb.Style = (Style)TryFindResource("LyricActiveStyle");
+                        try { tb.BringIntoView(); } catch { }
                     }
                     else
                     {
-                        tb.FontWeight = FontWeights.Normal;
-                        tb.Foreground = Brushes.White;
-                        tb.Opacity = 0.6;
+                        tb.Style = (Style)TryFindResource("LyricLineStyle");
                     }
                 }
             }
         }
+
+        private void ExportFeaturesButton_Click(object? sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(_pendingFilePath) || !File.Exists(_pendingFilePath))
+                {
+                    MessageBox.Show("Нет загруженного файла для извлечения features.", "Инфо", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+
+                var winText = this.FindName("MiniAlignWindowText") as TextBox;
+                int wms = 50;
+                if (winText != null && int.TryParse(winText.Text, out var tmp)) wms = Math.Max(10, Math.Min(500, tmp));
+
+                var na = new NeuralAligner();
+                var (features, timestamps) = na.ExtractFeaturesFromFile(_pendingFilePath!, wms);
+                // auto-save CSV to application Data folder without user prompt
+                try
+                {
+                    var dataDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Data");
+                    Directory.CreateDirectory(dataDir);
+                    var outPath = Path.Combine(dataDir, "features_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".csv");
+                    using var sw = new StreamWriter(outPath);
+                    sw.WriteLine("time_sec,rms,zcr,specCent,maxAbs");
+                    for (int i = 0; i < features.Length; i++)
+                    {
+                        var f = features[i];
+                        sw.WriteLine($"{timestamps[i]:F3},{f[0]:F6},{f[1]:F6},{f[2]:F6},{f[3]:F6}");
+                    }
+                    // update small UI hint
+                    try { LyricsSourceText.Text = "features saved: " + Path.GetFileName(outPath); } catch { }
+                }
+                catch { }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Ошибка экспорта: " + ex.Message, "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        // Live transcriber removed — method deleted
 
         private async void LoadMp3Button_Click_old(object sender, RoutedEventArgs e)
         {
@@ -903,7 +1032,288 @@ namespace WpfApp1
 
         private void RealTimeButton_Click(object sender, RoutedEventArgs e)
         {
-            MessageBox.Show("Real Time clicked", "Info", MessageBoxButton.OK, MessageBoxImage.Information);
+            // Enter or exit Real Time mode. When entering, show player-like UI (logo animation + cover + title)
+            if (!_realTimeEnabled)
+            {
+                _musicInfoService ??= new MusicInfoService();
+                _musicInfoService.OnMusicChanged += MusicInfoService_OnMusicChanged;
+                _musicInfoService.StartListening();
+                _realTimeEnabled = true;
+
+                // Show UI similar to loading mp3 but without playback controls
+                Dispatcher.Invoke(() =>
+                {
+                    LeftButtonsPanel.Visibility = Visibility.Collapsed;
+                    if (RootGrid.ColumnDefinitions.Count > 0)
+                        RootGrid.ColumnDefinitions[0].Width = new GridLength(0);
+
+                    // hide any player chrome
+                    ProgressAreaGrid.Visibility = Visibility.Collapsed;
+                    PlayPauseBottomButton.Visibility = Visibility.Collapsed;
+
+                    BackButton.Visibility = Visibility.Visible;
+
+                    AlbumCoverImage.Visibility = Visibility.Visible;
+                    SongTitleText.Opacity = 0;
+
+                    // disable lyrics overlay background in Real Time mode
+                    try
+                    {
+                        LyricsInputOverlay.Background = System.Windows.Media.Brushes.Transparent;
+                        if (LyricsInputInnerBorder != null) LyricsInputInnerBorder.Background = System.Windows.Media.Brushes.Transparent;
+                    }
+                    catch { }
+
+                    // animate logo to bottom-right as in MP3 mode
+                    StartLogoAnimation();
+                });
+
+                // start audio visualizer
+                try { _realTimeAudio?.Start(); AudioVisualizerCanvas.Visibility = Visibility.Visible; } catch { }
+            }
+            else
+            {
+                // stop real-time service and restore UI
+                try
+                {
+                    if (_musicInfoService != null)
+                    {
+                        _musicInfoService.OnMusicChanged -= MusicInfoService_OnMusicChanged;
+                        _musicInfoService.StopListening();
+                    }
+                }
+                catch { }
+                _realTimeEnabled = false;
+
+                try { _realTimeAudio?.Stop(); AudioVisualizerCanvas.Visibility = Visibility.Collapsed; } catch { }
+                // restore overlay backgrounds when exiting Real Time
+                try
+                {
+                    LyricsInputOverlay.Background = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#CC000000"));
+                    if (LyricsInputInnerBorder != null) LyricsInputInnerBorder.Background = new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#111111"));
+                }
+                catch { }
+
+                // reuse BackButton flow to restore UI
+                BackButton_Click(this, null);
+            }
+        }
+
+        private void RealTimeAudio_OnBandsReady(double[] bands, double ts)
+        {
+            // bands [low, mid, high] in 0..1
+            try
+            {
+                // If we're not in MP3 mode and system playback is paused, keep visualizer silent
+                if (!_inMp3Mode && !_systemIsPlaying)
+                {
+                    try { Dispatcher.Invoke(() => AudioVisualizerCanvas.Children.Clear()); } catch { }
+                    return;
+                }
+
+                Dispatcher.Invoke(() =>
+                {
+                    DrawVisualizer(bands);
+                });
+            }
+            catch { }
+        }
+
+        private void DrawVisualizer(double[] bands)
+        {
+            if (AudioVisualizerCanvas == null) return;
+            AudioVisualizerCanvas.Children.Clear();
+            double w = AudioVisualizerCanvas.ActualWidth;
+            double h = AudioVisualizerCanvas.ActualHeight;
+            if (w <= 0) w = 600;
+            if (h <= 0) h = 120;
+            int count = Math.Max(8, bands.Length); // use band count from service
+            // ensure smoothing buffer
+            if (_prevBands == null || _prevBands.Length != bands.Length) _prevBands = new double[bands.Length];
+
+            double spacing = 3.0;
+            double totalSpacing = spacing * (count - 1);
+            double bw = Math.Max(2, (w - totalSpacing) / count);
+
+            var brush = new SolidColorBrush(System.Windows.Media.Color.FromRgb(211, 211, 211));
+            for (int i = 0; i < count; i++)
+            {
+                double raw = (i < bands.Length) ? bands[i] : 0.0;
+                raw = Math.Min(1.0, Math.Max(0.0, raw));
+
+                // simple exponential smoothing to reduce flicker
+                double prev = _prevBands[i];
+                double smooth = prev * 0.7 + raw * 0.3;
+                _prevBands[i] = smooth;
+
+                double bh = smooth * h;
+                var rect = new System.Windows.Shapes.Rectangle { Width = bw, Height = bh, Fill = brush, RadiusX = 2, RadiusY = 2 };
+                Canvas.SetLeft(rect, i * (bw + spacing));
+                Canvas.SetTop(rect, h - bh);
+                AudioVisualizerCanvas.Children.Add(rect);
+            }
+        }
+
+        private async void MusicInfoService_OnMusicChanged(string title, string artist, string album, string? coverUrl)
+        {
+            try
+            {
+                // log incoming music info for debugging cover issues
+                try
+                {
+                    var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "musicinfo_events.txt");
+                    var ln = $"{DateTime.Now:o}\tTitle:{title}\tArtist:{artist}\tAlbum:{album}\tCoverUrl:{coverUrl}\n";
+                    System.IO.File.AppendAllText(logPath, ln);
+                }
+                catch { }
+
+                // update title on UI thread immediately so UI reflects detection even if cover loading fails
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    SongTitleText.Text = string.IsNullOrWhiteSpace(artist) ? title : $"{artist} - {title}";
+                    // show wallpaper micro panel with title immediately
+                    WallpaperTitleText.Text = SongTitleText.Text;
+                    WallpaperPanel.Visibility = Visibility.Visible;
+
+                    // fade-in title
+                    var titleFade = new DoubleAnimation(0, 1, new Duration(TimeSpan.FromMilliseconds(600))) { EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut } };
+                    SongTitleText.BeginAnimation(UIElement.OpacityProperty, titleFade);
+                });
+
+                // clear previous covers immediately to avoid stale art while we fetch new
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    AlbumCoverImageLeft.Source = null;
+                    AlbumCoverImage.Source = null;
+                    WallpaperCoverImage.Source = null;
+                });
+
+                // try fetch cover via provided URL first; otherwise attempt service lookup
+                System.Windows.Media.ImageSource? img = null;
+                string? triedUrl = null;
+                if (!string.IsNullOrWhiteSpace(coverUrl))
+                {
+                    triedUrl = coverUrl;
+                    _coverLoadCts?.Cancel();
+                    _coverLoadCts = new CancellationTokenSource();
+
+                    // if coverUrl is a local file path, load from file; otherwise treat as http(s)
+                    try
+                    {
+                        if (System.IO.File.Exists(coverUrl))
+                        {
+                            img = await LoadImageFromFileAsync(coverUrl);
+                        }
+                        else if (coverUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+                        {
+                            img = await LoadImageFromUrlAsync(coverUrl, _coverLoadCts.Token);
+                        }
+                    }
+                    catch { img = null; }
+                }
+
+                // log whether image was loaded
+                try
+                {
+                    var logPath2 = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "musicinfo_events.txt");
+                    var ln2 = $"{DateTime.Now:o}\tTriedUrl:{triedUrl}\tLoaded:{(img != null)}\n";
+                    System.IO.File.AppendAllText(logPath2, ln2);
+                }
+                catch { }
+
+                if (img != null)
+                {
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        AlbumCoverImageLeft.Source = img;
+                        AlbumCoverImage.Source = img;
+                        AlbumCoverImage.Visibility = _realTimeEnabled ? Visibility.Visible : Visibility.Collapsed;
+                        WallpaperCoverImage.Source = img;
+
+                        // set static background to a dimmed version of the cover (no blur)
+                        try
+                        {
+                            if (img is System.Windows.Media.Imaging.BitmapSource bs)
+                            {
+                                var brush = new ImageBrush(bs) { Stretch = System.Windows.Media.Stretch.UniformToFill, Opacity = 0.28 };
+                                StaticBackgroundRect.Fill = brush;
+                                try
+                                {
+                                    StaticBackgroundRect.Effect = new System.Windows.Media.Effects.BlurEffect { Radius = 24 };
+                                }
+                                catch { }
+                            }
+                        }
+                        catch { }
+                    });
+                }
+                else
+                {
+                    // if no cover found, ensure cover controls cleared and wallpaper panel kept visible
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        AlbumCoverImageLeft.Source = null;
+                        AlbumCoverImage.Source = null;
+                        WallpaperCoverImage.Source = null;
+                        AlbumCoverImage.Visibility = Visibility.Collapsed;
+                        WallpaperPanel.Visibility = Visibility.Visible;
+                    });
+                }
+            }
+            catch { }
+        }
+
+        private async Task<System.Windows.Media.ImageSource?> LoadImageFromUrlAsync(string url, CancellationToken ct)
+        {
+            try
+            {
+                using var client = new HttpClient();
+                using var resp = await client.GetAsync(url, ct);
+                resp.EnsureSuccessStatusCode();
+                var bytes = await resp.Content.ReadAsByteArrayAsync(ct);
+                return await Dispatcher.InvokeAsync(() =>
+                {
+                    try
+                    {
+                        var ms = new System.IO.MemoryStream(bytes);
+                        var bi = new System.Windows.Media.Imaging.BitmapImage();
+                        bi.BeginInit();
+                        bi.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
+                        bi.StreamSource = ms;
+                        bi.EndInit();
+                        bi.Freeze();
+                        return (System.Windows.Media.ImageSource)bi;
+                    }
+                    catch { return null; }
+                });
+            }
+            catch (OperationCanceledException) { return null; }
+            catch { return null; }
+        }
+
+        private async Task<System.Windows.Media.ImageSource?> LoadImageFromFileAsync(string path)
+        {
+            try
+            {
+                return await Dispatcher.InvokeAsync(() =>
+                {
+                    try
+                    {
+                        var bi = new System.Windows.Media.Imaging.BitmapImage();
+                        using (var fs = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.Read))
+                        {
+                            bi.BeginInit();
+                            bi.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
+                            bi.StreamSource = fs;
+                            bi.EndInit();
+                            bi.Freeze();
+                        }
+                        return (System.Windows.Media.ImageSource)bi;
+                    }
+                    catch { return null; }
+                });
+            }
+            catch { return null; }
         }
 
         private void SettingsButton_Click(object sender, RoutedEventArgs e)
@@ -1034,12 +1444,12 @@ namespace WpfApp1
             // toggle popup persistently
             if (VolumePopup.IsOpen)
             {
-                _wasOpenedByButton = false;
+                _popupPersistOpen = false;
                 CloseVolumePopup();
             }
             else
             {
-                _wasOpenedByButton = true;
+                _popupPersistOpen = true;
                 OpenVolumePopup();
             }
         }
@@ -1049,8 +1459,8 @@ namespace WpfApp1
             VolumePopup.IsOpen = true;
             // animate scale from 0.9 to 1.0 and fade in
             var sb = new Storyboard();
-            var scaleX = new DoubleAnimation(0.9, 1.0, new Duration(TimeSpan.FromMilliseconds(180))) { EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut } };
-            var scaleY = new DoubleAnimation(0.9, 1.0, new Duration(TimeSpan.FromMilliseconds(180))) { EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut } };
+            var scaleX = new DoubleAnimation(0.9, 1.0, new Duration(TimeSpan.FromMilliseconds(260))) { EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut } };
+            var scaleY = new DoubleAnimation(0.9, 1.0, new Duration(TimeSpan.FromMilliseconds(260))) { EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut } };
             Storyboard.SetTarget(scaleX, VolumePopupBorder);
             Storyboard.SetTarget(scaleY, VolumePopupBorder);
             Storyboard.SetTargetProperty(scaleX, new PropertyPath("(UIElement.RenderTransform).(ScaleTransform.ScaleX)"));
@@ -1064,22 +1474,26 @@ namespace WpfApp1
         {
             // animate scale down then close
             var sb = new Storyboard();
-            var scaleX = new DoubleAnimation(1.0, 0.9, new Duration(TimeSpan.FromMilliseconds(140))) { EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseIn } };
-            var scaleY = new DoubleAnimation(1.0, 0.9, new Duration(TimeSpan.FromMilliseconds(140))) { EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseIn } };
+            var scaleX = new DoubleAnimation(1.0, 0.9, new Duration(TimeSpan.FromMilliseconds(240))) { EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseIn } };
+            var scaleY = new DoubleAnimation(1.0, 0.9, new Duration(TimeSpan.FromMilliseconds(240))) { EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseIn } };
             Storyboard.SetTarget(scaleX, VolumePopupBorder);
             Storyboard.SetTarget(scaleY, VolumePopupBorder);
             Storyboard.SetTargetProperty(scaleX, new PropertyPath("(UIElement.RenderTransform).(ScaleTransform.ScaleX)"));
             Storyboard.SetTargetProperty(scaleY, new PropertyPath("(UIElement.RenderTransform).(ScaleTransform.ScaleY)"));
             sb.Children.Add(scaleX);
             sb.Children.Add(scaleY);
-            sb.Completed += (s, e) => VolumePopup.IsOpen = false;
+            sb.Completed += (s, e) =>
+            {
+                VolumePopup.IsOpen = false;
+                _popupPersistOpen = false;
+            };
             sb.Begin();
         }
 
         private void CloseVolumePopupIfAppropriate()
         {
             // close only if not opened by button (persistent)
-            if (_wasOpenedByButton) return;
+            if (_popupPersistOpen) return;
             CloseVolumePopup();
         }
 
@@ -1216,8 +1630,37 @@ namespace WpfApp1
 
                 // install torch (CPU by default)
                 DepsStatusText.Text = "Установка torch (CPU)...";
-                await RunCommandAsync("python", "-m pip install --index-url https://download.pytorch.org/whl/cpu torch");
-                DepsProgressBar.Value = 85;
+                try
+                {
+                    await RunCommandAsync("python", "-m pip install --index-url https://download.pytorch.org/whl/cpu torch");
+                }
+                catch
+                {
+                    // try generic torch as fallback
+                    await RunCommandAsync("python", "-m pip install -U torch");
+                }
+                DepsProgressBar.Value = 80;
+
+                // install demucs for vocal separation (improves ASR on songs)
+                DepsStatusText.Text = "Установка demucs (vocal separation)...";
+                try
+                {
+                    await RunCommandAsync("python", "-m pip install -U demucs");
+                    DepsProgressBar.Value = 88;
+                }
+                catch
+                {
+                    // ignore failure, continue
+                }
+
+                // optional: install spleeter as alternative separator
+                DepsStatusText.Text = "Установка spleeter (опционально)...";
+                try
+                {
+                    await RunCommandAsync("python", "-m pip install -U spleeter");
+                    DepsProgressBar.Value = 92;
+                }
+                catch { }
 
                 // ensure ffmpeg available: check and download into app folder if missing
                 bool ffmpegOk = true;
@@ -1234,12 +1677,20 @@ namespace WpfApp1
                     var target = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ffmpeg");
                     try
                     {
-                        await DownloadAndExtractFfmpegAsync(target);
-                        DepsProgressBar.Value = 95;
-                        DepsStatusText.Text = "ffmpeg установлен в папке приложения.";
+                        var ok = await DownloadAndExtractFfmpegAsync(target);
+                        if (ok)
+                        {
+                            DepsProgressBar.Value = 95;
+                            DepsStatusText.Text = "ffmpeg установлен в папке приложения.";
+                        }
+                        else
+                        {
+                            DepsStatusText.Text = "Не удалось установить ffmpeg (см. логи).";
+                        }
                     }
                     catch (Exception ex)
                     {
+                        // unexpected - report but don't crash
                         DepsStatusText.Text = "Не удалось установить ffmpeg: " + ex.Message;
                     }
                 }
@@ -1282,34 +1733,169 @@ namespace WpfApp1
             return outStr;
         }
 
-        private Task DownloadAndExtractFfmpegAsync(string targetFolder)
+        private async Task<bool> DownloadAndExtractFfmpegAsync(string targetFolder)
         {
-            return Task.Run(() =>
+            try
             {
+                Directory.CreateDirectory(targetFolder);
+                var url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+                var zipPath = Path.Combine(targetFolder, "ffmpeg.zip");
+                using (var http = new HttpClient())
+                using (var resp = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead))
+                {
+                    resp.EnsureSuccessStatusCode();
+                    using (var fs = File.Create(zipPath))
+                    {
+                        await resp.Content.CopyToAsync(fs);
+                    }
+                }
+
+                // extract
+                ZipFile.ExtractToDirectory(zipPath, targetFolder, true);
+                try { File.Delete(zipPath); } catch { }
+                return true;
+            }
+            catch (OperationCanceledException)
+            {
+                // treat cancellation as failure but do not throw
+                return false;
+            }
+            catch (Exception ex)
+            {
+                // log if possible and return failure
                 try
                 {
-                    Directory.CreateDirectory(targetFolder);
-                    var url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
-                    var zipPath = Path.Combine(targetFolder, "ffmpeg.zip");
-                    using (var http = new HttpClient())
-                    using (var resp = http.GetAsync(url).Result)
-                    {
-                        resp.EnsureSuccessStatusCode();
-                        using (var fs = File.Create(zipPath))
-                        {
-                            resp.Content.CopyToAsync(fs).Wait();
-                            fs.Close();
-                        }
-                    }
+                    var tf = Path.Combine(Path.GetTempPath(), "musicauto_ffmpeg_error.txt");
+                    File.AppendAllText(tf, DateTime.Now.ToString("o") + " - ffmpeg install error: " + ex.ToString() + Environment.NewLine);
+                }
+                catch { }
+                return false;
+            }
+        }
 
-                    ZipFile.ExtractToDirectory(zipPath, targetFolder, true);
-                    File.Delete(zipPath);
-                }
-                catch (Exception ex)
+        /// <summary>
+        /// Maps aligned words with timestamps back to original lyrics lines.
+        /// Each line gets the timestamp of its first word.
+        /// </summary>
+        private List<LyricsLine> MapWordsToLines(List<string> lines, List<WhisperClient.WordInfo> wordInfos)
+        {
+            var result = new List<LyricsLine>();
+            if (lines == null || lines.Count == 0) return result;
+            if (wordInfos == null || wordInfos.Count == 0)
+            {
+                // Fallback: create lines without timestamps
+                foreach (var line in lines)
                 {
-                    throw new Exception("Не удалось скачать или распаковать ffmpeg: " + ex.Message);
+                    result.Add(new LyricsLine { Timestamp = TimeSpan.Zero, Text = line });
                 }
-            });
+                return result;
+            }
+
+            // Build a flat list of words from all lines, keeping track of which line each word belongs to
+            var allWordsWithLineIndex = new List<(string word, int lineIndex)>();
+            for (int lineIdx = 0; lineIdx < lines.Count; lineIdx++)
+            {
+                var lineWords = Regex.Split(lines[lineIdx], @"\s+")
+                    .Where(w => !string.IsNullOrWhiteSpace(w))
+                    .ToArray();
+                foreach (var w in lineWords)
+                {
+                    allWordsWithLineIndex.Add((w, lineIdx));
+                }
+            }
+
+            // Track first word timestamp for each line
+            var lineFirstTimestamp = new double[lines.Count];
+            var lineHasTimestamp = new bool[lines.Count];
+            for (int i = 0; i < lines.Count; i++)
+            {
+                lineFirstTimestamp[i] = -1;
+                lineHasTimestamp[i] = false;
+            }
+
+            // Match aligned words to lyrics words sequentially
+            int alignedIdx = 0;
+            for (int i = 0; i < allWordsWithLineIndex.Count && alignedIdx < wordInfos.Count; i++)
+            {
+                var (lyricsWord, lineIdx) = allWordsWithLineIndex[i];
+                var lyricsWordNorm = NormalizeWord(lyricsWord);
+                
+                // Look for matching word in aligned words (within reasonable range)
+                bool found = false;
+                int searchLimit = Math.Min(alignedIdx + 15, wordInfos.Count);
+                
+                for (int j = alignedIdx; j < searchLimit; j++)
+                {
+                    var alignedWordNorm = NormalizeWord(wordInfos[j].Word);
+                    
+                    // Check for match (exact or substring)
+                    if (lyricsWordNorm == alignedWordNorm || 
+                        (lyricsWordNorm.Length > 2 && alignedWordNorm.Contains(lyricsWordNorm)) ||
+                        (alignedWordNorm.Length > 2 && lyricsWordNorm.Contains(alignedWordNorm)))
+                    {
+                        // Found match - record timestamp for this line if it's the first word
+                        if (!lineHasTimestamp[lineIdx])
+                        {
+                            lineFirstTimestamp[lineIdx] = wordInfos[j].Start;
+                            lineHasTimestamp[lineIdx] = true;
+                        }
+                        alignedIdx = j + 1;
+                        found = true;
+                        break;
+                    }
+                }
+                
+                // If no match found, advance aligned index slightly to avoid getting stuck
+                if (!found && alignedIdx < wordInfos.Count)
+                {
+                    alignedIdx++;
+                }
+            }
+
+            // Create LyricsLine objects with timestamps
+            double lastTimestamp = 0.0;
+            for (int i = 0; i < lines.Count; i++)
+            {
+                double timestamp;
+                if (lineHasTimestamp[i])
+                {
+                    timestamp = lineFirstTimestamp[i];
+                    lastTimestamp = timestamp;
+                }
+                else
+                {
+                    // Estimate timestamp based on position
+                    timestamp = lastTimestamp + 2.0; // Default gap
+                    lastTimestamp = timestamp;
+                }
+                
+                result.Add(new LyricsLine 
+                { 
+                    Timestamp = TimeSpan.FromSeconds(timestamp), 
+                    Text = lines[i],
+                    IsScream = false // Could detect from audio energy later
+                });
+            }
+
+            // Ensure timestamps are monotonically increasing
+            for (int i = 1; i < result.Count; i++)
+            {
+                if (result[i].Timestamp <= result[i - 1].Timestamp)
+                {
+                    result[i].Timestamp = result[i - 1].Timestamp.Add(TimeSpan.FromMilliseconds(500));
+                }
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Normalizes a word for comparison by removing punctuation and converting to lowercase.
+        /// </summary>
+        private static string NormalizeWord(string word)
+        {
+            if (string.IsNullOrWhiteSpace(word)) return string.Empty;
+            return Regex.Replace(word.ToLowerInvariant(), @"[^\w]", "");
         }
 
         private async Task StartAutoResyncLoopAsync(CancellationToken token)

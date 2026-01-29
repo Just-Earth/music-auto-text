@@ -4,9 +4,27 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d"
-        Title="MainWindow" Height="450" Width="800" Background="Black">
+        Title="MainWindow" Height="450" Width="800" Background="Transparent">
 
     <Window.Resources>
+        <!-- Lyrics styles -->
+        <Style x:Key="LyricLineStyle" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#777" />
+            <Setter Property="FontSize" Value="28" />
+            <Setter Property="Margin" Value="6" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+            <Setter Property="Opacity" Value="0.45" />
+            <Setter Property="HorizontalAlignment" Value="Center" />
+            <Setter Property="TextAlignment" Value="Center" />
+        </Style>
+
+        <Style x:Key="LyricActiveStyle" TargetType="TextBlock" BasedOn="{StaticResource LyricLineStyle}">
+            <Setter Property="Foreground" Value="White" />
+            <Setter Property="FontSize" Value="36" />
+            <Setter Property="FontWeight" Value="Bold" />
+            <Setter Property="Opacity" Value="1.0" />
+        </Style>
+
         <!-- Default button style -->
         <Style TargetType="Button">
             <Setter Property="Background" Value="Transparent" />
@@ -182,7 +200,7 @@
         </Grid.ColumnDefinitions>
 
         <!-- Static background rectangle (image fill) -->
-        <Rectangle x:Name="StaticBackgroundRect" Fill="Black" Visibility="Visible" Panel.ZIndex="-2" Grid.ColumnSpan="2" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
+        <Rectangle x:Name="StaticBackgroundRect" Fill="Transparent" Visibility="Visible" Panel.ZIndex="-2" Grid.ColumnSpan="2" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
 
         <!-- Back button (appears when inside player view) -->
         <Button x:Name="BackButton" Grid.ColumnSpan="2" Content="←" Width="36" Height="36" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="10" Style="{StaticResource SettingsIconButton}" Panel.ZIndex="3" Visibility="Collapsed" />
@@ -209,6 +227,30 @@
                 </ComboBox>
             </StackPanel>
 
+            <!-- Mini neural aligner UI -->
+            <Border Margin="0,12,0,6" Width="212" Padding="8" Background="#11000000" CornerRadius="6">
+                <StackPanel>
+                    <TextBlock Text="Mini aligner" Foreground="White" FontSize="12" Margin="0,0,0,6" />
+                    <CheckBox x:Name="UseMiniAlignCheck" Content="Включить mini-нейрон" IsChecked="True" Foreground="White" />
+                    <TextBlock Text="Окно (ms):" Foreground="White" FontSize="11" Margin="0,8,0,2" />
+                    <TextBox x:Name="MiniAlignWindowText" Text="50" Width="80" Height="22" />
+                    <Button x:Name="ExportFeaturesButton" Content="Экспорт features" Margin="0,8,0,0" Width="200" Height="28" />
+                </StackPanel>
+            </Border>
+
+        <!-- Debug panel showing UIA text nodes (for Real Time troubleshooting) -->
+        <Border x:Name="UiDebugBorder" Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,120,10,0" Background="#22000000" Padding="8" CornerRadius="6" Visibility="Collapsed" Panel.ZIndex="110">
+            <StackPanel>
+                <TextBlock Text="UI text nodes:" Foreground="#DDD" FontSize="12" Margin="0,0,0,6" />
+                <ScrollViewer Height="180" Width="240">
+                    <StackPanel x:Name="UiDebugList" />
+                </ScrollViewer>
+            </StackPanel>
+        </Border>
+
+        <!-- Lyrics source indicator (shows which method produced lyrics) -->
+        <TextBlock x:Name="LyricsSourceText" Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,10,10,0" Foreground="#EEE" FontSize="12" FontWeight="Bold" Text="" Panel.ZIndex="115" />
+
             <!-- Neural aligner tools (hidden) -->
             <Button x:Name="GenerateSamplesButton" Content="Сгенерировать примеры" Margin="0,12,0,6" Width="212" Height="40" FontSize="14" Visibility="Collapsed" />
             <Button x:Name="TrainModelButton" Content="Обучить модель" Margin="0,0,0,6" Width="212" Height="40" FontSize="14" Visibility="Collapsed" />
@@ -225,6 +267,16 @@
         <!-- Settings button top-right -->
         <Button x:Name="SettingsButton" Grid.Column="1" Content="⚙" Width="36" Height="36" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,10,10,0" Style="{StaticResource SettingsIconButton}" Panel.ZIndex="2" />
 
+        <!-- Wallpaper micro panel (top-right) -->
+        <StackPanel x:Name="WallpaperPanel" Grid.Column="1" Orientation="Vertical" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,10,90,0" Visibility="Collapsed" Panel.ZIndex="6">
+            <Border Background="#00000000" CornerRadius="6" Padding="6" Width="84" Height="100">
+                <StackPanel Orientation="Vertical" HorizontalAlignment="Center">
+                    <Image x:Name="WallpaperCoverImage" Width="72" Height="72" Stretch="UniformToFill" />
+                    <TextBlock x:Name="WallpaperTitleText" Text="" Foreground="White" FontSize="10" TextAlignment="Center" TextWrapping="Wrap" Margin="0,6,0,0" />
+                </StackPanel>
+            </Border>
+        </StackPanel>
+
         <!-- Song title centered at top of window -->
         <TextBlock x:Name="SongTitleText" Grid.ColumnSpan="2" Text="" Foreground="White" FontSize="24" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,12,0,0" TextAlignment="Center" Opacity="0" />
 
@@ -238,17 +290,35 @@
             </TextBlock.RenderTransform>
         </TextBlock>
 
-        <!-- Player and lyrics area -->
+        <!-- Album cover for Real Time (center-left) -->
+            <Image x:Name="AlbumCoverImage" Grid.ColumnSpan="2" Width="396" Height="396" HorizontalAlignment="Left" VerticalAlignment="Center" Margin="40,0,0,0" Visibility="Collapsed" Stretch="UniformToFill" Panel.ZIndex="3" />
+
+        <!-- Player and lyrics area (two-column: cover left, lyrics right) -->
         <Grid Grid.Column="1" Margin="10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="360" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
             </Grid.RowDefinitions>
 
-            <!-- Lyrics area (centered) -->
-            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
-                <StackPanel x:Name="LyricsPanel" HorizontalAlignment="Center" Width="600" />
+            <!-- Album art area (left) (hidden on main screen) -->
+            <Border Grid.Column="0" Grid.RowSpan="2" HorizontalAlignment="Left" VerticalAlignment="Center" Width="576" Height="576" CornerRadius="6" Background="#1a1a1a" Padding="12" Margin="20,0,20,0" Visibility="Collapsed" x:Name="AlbumCoverLeftBorder">
+                <Border.Effect>
+                    <DropShadowEffect BlurRadius="18" ShadowDepth="6" Opacity="0.6" />
+                </Border.Effect>
+                <Image x:Name="AlbumCoverImageLeft" Stretch="UniformToFill" />
+            </Border>
+
+            <!-- Lyrics area (centered, right column) -->
+            <ScrollViewer Grid.Column="1" Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="0,60,0,160">
+                <StackPanel x:Name="LyricsPanel" HorizontalAlignment="Center" Width="720" />
             </ScrollViewer>
+
+            <!-- Audio visualizer canvas (moved to bottom center) -->
+            <!-- (hidden by default; shown in Real Time mode) -->
 
         </Grid>
 
@@ -277,7 +347,7 @@
                     <!-- volume container (hover to show popup) -->
                     <Grid Grid.Column="1" x:Name="VolumeContainer" Width="56" Height="36" HorizontalAlignment="Left" VerticalAlignment="Center" Margin="8,0,0,0" MouseEnter="VolumeContainer_MouseEnter" MouseLeave="VolumeContainer_MouseLeave">
                         <!-- Popup panel above the button so it won't be clipped by layout -->
-                        <Popup x:Name="VolumePopup" PlacementTarget="{Binding ElementName=VolumeButton}" Placement="Top" StaysOpen="True" AllowsTransparency="True" PopupAnimation="Fade">
+                        <Popup x:Name="VolumePopup" PlacementTarget="{Binding ElementName=VolumeButton}" Placement="Top" VerticalOffset="-16" StaysOpen="True" AllowsTransparency="True" PopupAnimation="Fade">
                             <Border x:Name="VolumePopupBorder" Width="48" Height="220" Background="#CC000000" CornerRadius="6" Padding="6" RenderTransformOrigin="0.5,0.0">
                                 <Border.RenderTransform>
                                     <ScaleTransform ScaleX="0.9" ScaleY="0.9" />
@@ -334,6 +404,11 @@
 
                 <Button x:Name="PlayPauseBottomButton" Width="56" Height="40" Content="▶" Style="{StaticResource SettingsIconButton}" HorizontalAlignment="Center" Margin="0,8,0,0" Visibility="Collapsed" Opacity="0" />
             </StackPanel>
+        </Grid>
+
+        <!-- Centered visualizer below lyrics -->
+        <Grid Grid.ColumnSpan="2" HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,110" Panel.ZIndex="5">
+            <Canvas x:Name="AudioVisualizerCanvas" Width="720" Height="120" HorizontalAlignment="Center" VerticalAlignment="Bottom" IsHitTestVisible="False" />
         </Grid>
 
         <!-- Full-window settings overlay (hidden by default) -->
@@ -393,7 +468,7 @@
         <!-- Lyrics input overlay shown after selecting file -->
         <Border x:Name="LyricsInputOverlay" Grid.ColumnSpan="2" Background="#CC000000" Visibility="Collapsed" Panel.ZIndex="200">
             <Grid HorizontalAlignment="Center" VerticalAlignment="Center" Width="640" Height="260">
-                <Border Background="#111111" CornerRadius="8" Padding="18">
+                <Border x:Name="LyricsInputInnerBorder" Background="#111111" CornerRadius="8" Padding="18">
                     <StackPanel>
                         <TextBlock Text="Введите артиста и название трека" Foreground="White" FontSize="18" FontWeight="Bold" Margin="0,0,0,12" />
                         <StackPanel Orientation="Horizontal" Margin="0,6,0,0">

@@ -2,12 +2,13 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net10.0-windows</TargetFramework>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
     <PlatformTarget>x64</PlatformTarget>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <!-- WinRT integration is optional. Define 'USE_WINRT' when building with WinRT support. -->
   </PropertyGroup>
 
   <ItemGroup>
@@ -15,6 +16,32 @@
     <PackageReference Include="LibVLCSharp.WPF" Version="3.9.5" />
     <PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.21" />
     <PackageReference Include="NAudio" Version="2.1.0" />
+    <!-- Optional WinRT APIs for GlobalSystemMediaTransportControls (enable when building with /p:DefineConstants=USE_WINRT) -->
+    <!-- WinRT contracts available via TFM; explicit package removed -->
+  </ItemGroup>
+  <!-- Ensure Models folder (Vosk model) is copied to output so Vosk can load it at runtime -->
+  <!-- Models folder removed (Vosk integration disabled) -->
+
+  <!-- Prevent accidental compilation of generated files in obj/bin if glob patterns were previously used -->
+  <ItemGroup>
+    <Compile Remove="obj\**\*.cs" />
+    <Compile Remove="bin\**\*.cs" />
+  </ItemGroup>
+
+  <!-- Copy native and data folders to publish output -->
+  <ItemGroup>
+    <Content Include="Data\**\*">
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <Content Include="ffmpeg\**\*">
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <Content Include="libvlc\**\*">
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <Content Include="Models\**\*">
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
   </ItemGroup>
 
 </Project>
